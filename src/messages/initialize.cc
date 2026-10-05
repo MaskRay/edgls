@@ -370,11 +370,9 @@ void do_initialize(MessageHandler *m, InitializeParam &param, ReplyOnce &reply) 
   if (!g_config->client.snippetSupport)
     g_config->completion.duplicateOptional = false;
 
-  // Ensure there is a resource directory.
-  if (g_config->clang.resourceDir.empty())
-    g_config->clang.resourceDir = getDefaultResourceDirectory();
-  doPathMapping(g_config->clang.resourceDir);
-  LOG_S(INFO) << "use -resource-dir=" << g_config->clang.resourceDir;
+  if (g_config->edg.baseDir.empty())
+    g_config->edg.baseDir = getDefaultEdgBaseDirectory();
+  LOG_S(INFO) << "use EDG base directory " << g_config->edg.baseDir;
 
   // Send initialization before starting indexers, so we don't send a
   // status update too early.
@@ -437,7 +435,6 @@ void do_initialize(MessageHandler *m, InitializeParam &param, ReplyOnce &reply) 
   LOG_S(INFO) << "dispatch initial index requests";
   m->project->index(m->wfiles, reply.id);
 
-  m->manager->sessions.setCapacity(g_config->session.maxNum);
 }
 
 void MessageHandler::initialize(JsonReader &reader, ReplyOnce &reply) {

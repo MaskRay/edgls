@@ -7,6 +7,8 @@
 #include "sema_manager.hh"
 #include "working_files.hh"
 
+#include <llvm/Support/Path.h>
+
 namespace ccls {
 void MessageHandler::textDocument_didChange(TextDocumentDidChangeParam &param) {
   std::string path = param.textDocument.uri.getPath();

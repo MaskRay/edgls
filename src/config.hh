@@ -35,7 +35,7 @@ struct Config {
     //
     // If empty, retainInMemory will be set to 1 and cache will be stored in
     // memory.
-    std::string directory = ".ccls-cache";
+    std::string directory = ".edgls-cache";
 
     // Cache serialization format.
     //
@@ -106,13 +106,13 @@ struct Config {
     // replacement, so "clang /prefix/container/a.cc" will become "clang
     // /prefix/host/a.cc".
     std::vector<std::string> pathMappings;
-
-    // Value to use for clang -resource-dir if not specified.
-    //
-    // This option defaults to clang -print-resource-dir and should not be
-    // specified unless you are using an esoteric configuration.
-    std::string resourceDir;
   } clang;
+
+  struct Edg {
+    // The EDG base directory, which contains lib/predefined_macros.txt.
+    // Defaults to the directory configured at build time.
+    std::string baseDir;
+  } edg;
 
   struct ClientCapability {
     // TextDocumentClientCapabilities.publishDiagnostics.relatedInformation
@@ -333,7 +333,8 @@ REFLECT_STRUCT(Config::ServerCap::DocumentOnTypeFormattingOptions, firstTriggerC
 REFLECT_STRUCT(Config::ServerCap::Workspace::WorkspaceFolders, supported, changeNotifications);
 REFLECT_STRUCT(Config::ServerCap::Workspace, workspaceFolders);
 REFLECT_STRUCT(Config::ServerCap, documentOnTypeFormattingProvider, foldingRangeProvider, workspace);
-REFLECT_STRUCT(Config::Clang, excludeArgs, prependArgs, extraArgs, pathMappings, resourceDir);
+REFLECT_STRUCT(Config::Clang, excludeArgs, prependArgs, extraArgs, pathMappings);
+REFLECT_STRUCT(Config::Edg, baseDir);
 REFLECT_STRUCT(Config::ClientCapability, diagnosticsRelatedInformation, hierarchicalDocumentSymbolSupport, linkSupport,
                snippetSupport);
 REFLECT_STRUCT(Config::CodeLens, localVariables);
@@ -350,7 +351,7 @@ REFLECT_STRUCT(Config::Request, timeout);
 REFLECT_STRUCT(Config::Session, maxNum);
 REFLECT_STRUCT(Config::WorkspaceSymbol, caseSensitivity, maxNum, sort);
 REFLECT_STRUCT(Config::Xref, maxNum);
-REFLECT_STRUCT(Config, compilationDatabaseCommand, compilationDatabaseDirectory, cache, capabilities, clang, client,
+REFLECT_STRUCT(Config, compilationDatabaseCommand, compilationDatabaseDirectory, cache, capabilities, clang, edg, client,
                codeLens, completion, diagnostics, highlight, index, request, session, workspaceSymbol, xref);
 
 extern Config *g_config;

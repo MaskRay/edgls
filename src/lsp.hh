@@ -227,7 +227,7 @@ struct Diagnostic {
   lsRange range;
   int severity = 0;
   int code = 0;
-  std::string source = "ccls";
+  std::string source = "edgls";
   std::string message;
   std::vector<DiagnosticRelatedInformation> relatedInformation;
   std::vector<TextEdit> fixits_;

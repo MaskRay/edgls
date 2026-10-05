@@ -8,8 +8,6 @@
 #include "serializer.hh"
 #include "utils.hh"
 
-#include <clang/Basic/SourceLocation.h>
-#include <clang/Basic/Specifiers.h>
 #include <llvm/ADT/CachedHashString.h>
 #include <llvm/ADT/DenseMap.h>
 
@@ -23,14 +21,10 @@
 #define endswith ends_with
 #endif
 
-namespace std {
-template <> struct hash<clang::FileID> {
-  std::size_t operator()(clang::FileID fid) const { return fid.getHashValue(); }
-};
-} // namespace std
-
 namespace ccls {
 using Usr = uint64_t;
+
+enum StorageClass : uint8_t { SC_None, SC_Extern, SC_Static, SC_PrivateExtern, SC_Auto, SC_Register };
 
 // The order matters. In findSymbolsAtLocation, we want Var/Func ordered in
 // front of others.
@@ -155,7 +149,7 @@ template <template <typename T> class V> struct FuncDef : NameMixin<FuncDef<V>> 
   int16_t short_name_size = 0;
   SymbolKind kind = SymbolKind::Unknown;
   SymbolKind parent_kind = SymbolKind::Unknown;
-  uint8_t storage = clang::SC_None;
+  uint8_t storage = SC_None;
 
   const Usr *bases_begin() const { return bases.begin(); }
   const Usr *bases_end() const { return bases.end(); }
@@ -227,13 +221,13 @@ struct VarDef : NameMixin<VarDef> {
   SymbolKind parent_kind = SymbolKind::Unknown;
   // Note a variable may have instances of both |None| and |Extern|
   // (declaration).
-  uint8_t storage = clang::SC_None;
+  uint8_t storage = SC_None;
 
   bool is_local() const {
     return spell &&
            (parent_kind == SymbolKind::Function || parent_kind == SymbolKind::Method ||
             parent_kind == SymbolKind::StaticMethod || parent_kind == SymbolKind::Constructor) &&
-           (storage == clang::SC_None || storage == clang::SC_Auto || storage == clang::SC_Register);
+           (storage == SC_None || storage == SC_Auto || storage == SC_Register);
   }
 
   const Usr *bases_begin() const { return nullptr; }
@@ -269,13 +263,10 @@ struct IndexFile {
 
   std::string path;
   std::vector<const char *> args;
-  // This is unfortunately time_t as used by clang::FileEntry
   int64_t mtime = 0;
   LanguageId language = LanguageId::C;
   bool no_linkage;
 
-  // uid2lid_and_path is used to generate lid2path, but not serialized.
-  std::unordered_map<clang::FileID, std::pair<int, std::string>> uid2lid_and_path;
   std::vector<std::pair<int, std::string>> lid2path;
 
   // The path to the translation unit cc file which caused the creation of this

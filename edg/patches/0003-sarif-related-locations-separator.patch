@@ -1,0 +1,16 @@
+--- a/src/error.c
++++ b/src/error.c
+@@ -4897,12 +4897,12 @@
+       /* Unlike other messages, the primary diagnostic is not known when the
+          more_info messages are created. */
+       mi_dp->primary_diag = dp;
+-      write_sarif_related_location(mi_dp);
+       if (first) {
+         first = FALSE;
+       } else {
+         add_char_to_text_buffer(write_diagnostic_buffer, ',');
+       }  /* if */
++      write_sarif_related_location(mi_dp);
+     }  /* for */
+     add_char_to_text_buffer(write_diagnostic_buffer, ']');
+   }  /* if */

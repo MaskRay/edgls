@@ -198,6 +198,16 @@ std::optional<SymbolInformation> getSymbolInfo(DB *db, SymbolIdx sym, bool detai
 std::vector<SymbolRef> findSymbolsAtLocation(WorkingFile *working_file, QueryFile *file, Position &ls_pos,
                                              bool smallest = false);
 
+// The function definition containing |pos| (an index position) and the class
+// it is a member of.
+std::pair<Usr, Usr> findEnclosingFunction(DB *db, QueryFile *file, Pos pos);
+
+// Resolve |name| (optionally qualified by |qualifier|, e.g. "std::chrono")
+// as seen from |pos| (an index position) in |file|, when the index has no
+// occurrence there, e.g. on a line being edited.
+std::vector<SymbolIdx> lookupName(DB *db, QueryFile *file, Pos pos, std::string_view name,
+                                  std::string_view qualifier);
+
 template <typename Fn> void withEntity(DB *db, SymbolIdx sym, Fn &&fn) {
   switch (sym.kind) {
   case Kind::Invalid:

@@ -6,7 +6,7 @@
 #include "log.hh"
 #include "position.hh"
 
-#include <clang/Basic/CharInfo.h>
+#include <llvm/ADT/StringRef.h>
 
 #include <algorithm>
 #include <chrono>
@@ -14,19 +14,9 @@
 #include <numeric>
 namespace chrono = std::chrono;
 
-using namespace clang;
 using namespace llvm;
 
 namespace ccls {
-namespace {
-
-// When finding a best match of buffer line and index line, limit the max edit
-// distance.
-constexpr int kMaxDiff = 20;
-// Don't align index line to buffer line if one of the lengths is larger than
-// |kMaxColumnAlignSize|.
-constexpr int kMaxColumnAlignSize = 200;
-
 Position getPositionForOffset(const std::string &content, int offset) {
   if (offset >= content.size())
     offset = (int)content.size() - 1;
@@ -41,6 +31,15 @@ Position getPositionForOffset(const std::string &content, int offset) {
   }
   return {line, col};
 }
+
+namespace {
+
+// When finding a best match of buffer line and index line, limit the max edit
+// distance.
+constexpr int kMaxDiff = 20;
+// Don't align index line to buffer line if one of the lengths is larger than
+// |kMaxColumnAlignSize|.
+constexpr int kMaxColumnAlignSize = 200;
 
 std::vector<std::string> toLines(const std::string &c) {
   std::vector<std::string> ret;
@@ -325,9 +324,6 @@ std::optional<int> WorkingFile::getIndexPosFromBufferPos(int line, int *column, 
 Position WorkingFile::getCompletionPosition(Position pos, std::string *filter) const {
   int start = getOffsetForPosition(pos, buffer_content);
   int i = start;
-#if LLVM_VERSION_MAJOR < 14 // llvmorg-14-init-3863-g601102d282d5
-#define isAsciiIdentifierContinue isIdentifierBody
-#endif
   while (i > 0 && isAsciiIdentifierContinue(buffer_content[i - 1]))
     --i;
   *filter = buffer_content.substr(i, start - i);

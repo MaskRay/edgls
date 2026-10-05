@@ -12,7 +12,7 @@ OUTPUT:
   "includes": [],
   "skipped_ranges": [],
   "usr2func": [{
-      "usr": 9630503130605430498,
+      "usr": 12639959675847837540,
       "detailed_name": "static int helper()",
       "qual_name_offset": 11,
       "short_name": "helper",
@@ -22,29 +22,13 @@ OUTPUT:
       "callees": [],
       "kind": 12,
       "parent_kind": 1,
-      "storage": 0,
+      "storage": 2,
       "declarations": [],
       "derived": [],
       "uses": ["6:11-6:17|36|-1"]
     }],
   "usr2type": [{
-      "usr": 472,
-      "detailed_name": "",
-      "qual_name_offset": 0,
-      "short_name": "",
-      "bases": [],
-      "funcs": [],
-      "types": [],
-      "vars": [],
-      "alias_of": 0,
-      "kind": 0,
-      "parent_kind": 0,
-      "declarations": [],
-      "derived": [],
-      "instances": [4220150017963593039],
-      "uses": []
-    }, {
-      "usr": 15041163540773201510,
+      "usr": 11569259296725656241,
       "detailed_name": "class Foo {}",
       "qual_name_offset": 6,
       "short_name": "Foo",
@@ -53,7 +37,7 @@ OUTPUT:
       "funcs": [],
       "types": [],
       "vars": [{
-          "L": 4220150017963593039,
+          "L": 13262920552766832354,
           "R": 0
         }],
       "alias_of": 0,
@@ -65,13 +49,13 @@ OUTPUT:
       "uses": []
     }],
   "usr2var": [{
-      "usr": 4220150017963593039,
+      "usr": 13262920552766832354,
       "detailed_name": "int Foo::x",
       "qual_name_offset": 4,
       "short_name": "x",
       "hover": "int Foo::x = helper()",
-      "spell": "6:7-6:8|6:3-6:19|1026|-1",
-      "type": 472,
+      "spell": "6:7-6:8|6:3-6:19|2|-1",
+      "type": 0,
       "kind": 8,
       "parent_kind": 5,
       "storage": 0,

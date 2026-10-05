@@ -38,6 +38,10 @@ struct GroupMatch {
 
 uint64_t hashUsr(llvm::StringRef s);
 
+inline bool isAsciiIdentifierContinue(unsigned char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
 std::string lowerPathIfInsensitive(const std::string &path);
 
 // Ensures that |path| ends in a slash.
@@ -85,7 +89,7 @@ template <typename T, typename... Rest> inline void hash_combine(std::size_t &se
   };                                                                                                                   \
   }
 
-std::string getDefaultResourceDirectory();
+std::string getDefaultEdgBaseDirectory();
 
 // Like std::optional, but the stored data is responsible for containing the
 // empty state. T should define a function `bool T::valid()`.

@@ -17,22 +17,22 @@ OUTPUT:
   "includes": [],
   "skipped_ranges": [],
   "usr2func": [{
-      "usr": 9720930732776154610,
+      "usr": 8917140797287640201,
       "detailed_name": "int a()",
       "qual_name_offset": 4,
       "short_name": "a",
-      "spell": "12:1-12:20|12:1-12:4|2|-1",
+      "spell": "12:1-12:4|12:1-12:4|2|-1",
       "bases": [],
       "vars": [],
-      "callees": ["12:5-12:10|14400399977994209582|3|16420"],
+      "callees": ["12:1-12:4|11119574266751322774|3|36"],
       "kind": 12,
       "parent_kind": 1,
       "storage": 0,
-      "declarations": ["12:1-12:20|12:1-12:4|1|-1"],
+      "declarations": [],
       "derived": [],
-      "uses": ["2:7-2:8|64|0", "3:7-3:8|64|0"]
+      "uses": []
     }, {
-      "usr": 14400399977994209582,
+      "usr": 11119574266751322774,
       "detailed_name": "int make1()",
       "qual_name_offset": 4,
       "short_name": "make1",
@@ -45,51 +45,35 @@ OUTPUT:
       "storage": 0,
       "declarations": [],
       "derived": [],
-      "uses": ["12:5-12:10|16420|-1", "12:5-12:10|64|0"]
+      "uses": ["12:1-12:4|36|-1"]
     }],
-  "usr2type": [{
-      "usr": 472,
-      "detailed_name": "",
-      "qual_name_offset": 0,
-      "short_name": "",
-      "bases": [],
-      "funcs": [],
-      "types": [],
-      "vars": [],
-      "alias_of": 0,
-      "kind": 0,
-      "parent_kind": 0,
-      "declarations": [],
-      "derived": [],
-      "instances": [2878407290385495202],
-      "uses": []
-    }],
+  "usr2type": [],
   "usr2var": [{
-      "usr": 2878407290385495202,
-      "detailed_name": "const int make2",
-      "qual_name_offset": 10,
+      "usr": 17915766478539034828,
+      "detailed_name": "static const int make2",
+      "qual_name_offset": 17,
       "short_name": "make2",
-      "hover": "const int make2 = 5",
+      "hover": "static const int make2 = 5",
       "spell": "9:11-9:16|9:1-9:20|2|-1",
-      "type": 472,
+      "type": 0,
       "kind": 13,
       "parent_kind": 1,
-      "storage": 0,
+      "storage": 2,
       "declarations": [],
-      "uses": ["12:14-12:19|12|-1", "12:14-12:19|64|0"]
+      "uses": ["12:1-12:4|12|-1"]
     }, {
-      "usr": 14219599523415845943,
+      "usr": 18043316707112767911,
       "detailed_name": "FOO",
       "qual_name_offset": 0,
       "short_name": "FOO",
       "hover": "#define FOO(aaa, bbb) \\\n  int a();\\\n  int a() { return aaa + bbb; }",
-      "spell": "1:9-1:12|1:9-3:32|2|-1",
+      "spell": "1:9-1:12|1:1-3:32|2|-1",
       "type": 0,
       "kind": 255,
       "parent_kind": 1,
       "storage": 0,
       "declarations": [],
-      "uses": ["12:1-12:4|64|-1"]
+      "uses": ["12:1-12:4|4|-1"]
     }]
 }
 */

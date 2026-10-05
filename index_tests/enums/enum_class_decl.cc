@@ -11,7 +11,30 @@ OUTPUT:
   "skipped_ranges": [],
   "usr2func": [],
   "usr2type": [{
-      "usr": 2010430204259339553,
+      "usr": 11569259296725656241,
+      "detailed_name": "enum class Foo : uint8_t {}",
+      "qual_name_offset": 11,
+      "short_name": "Foo",
+      "spell": "2:12-2:15|2:1-5:2|2|-1",
+      "bases": [],
+      "funcs": [],
+      "types": [],
+      "vars": [{
+          "L": 14764555744278245583,
+          "R": -1
+        }, {
+          "L": 7566877418593801577,
+          "R": -1
+        }],
+      "alias_of": 0,
+      "kind": 10,
+      "parent_kind": 1,
+      "declarations": [],
+      "derived": [],
+      "instances": [],
+      "uses": []
+    }, {
+      "usr": 16598673977360118010,
       "detailed_name": "typedef unsigned char uint8_t",
       "qual_name_offset": 22,
       "short_name": "uint8_t",
@@ -27,50 +50,26 @@ OUTPUT:
       "derived": [],
       "instances": [],
       "uses": ["2:18-2:25|4|-1"]
-    }, {
-      "usr": 16985894625255407295,
-      "detailed_name": "enum class Foo : uint8_t {}",
-      "qual_name_offset": 11,
-      "short_name": "Foo",
-      "spell": "2:12-2:15|2:1-5:2|2|-1",
-      "bases": [],
-      "funcs": [],
-      "types": [],
-      "vars": [{
-          "L": 439339022761937396,
-          "R": -1
-        }, {
-          "L": 15962370213938840720,
-          "R": -1
-        }],
-      "alias_of": 0,
-      "kind": 10,
-      "parent_kind": 1,
-      "declarations": [],
-      "derived": [],
-      "instances": [],
-      "uses": []
     }],
   "usr2var": [{
-      "usr": 439339022761937396,
-      "detailed_name": "Foo::A",
+      "usr": 7566877418593801577,
+      "detailed_name": "Foo::B = 20U",
       "qual_name_offset": 0,
-      "short_name": "A",
-      "hover": "Foo::A = 0",
-      "spell": "3:3-3:4|3:3-3:4|1026|-1",
-      "type": 16985894625255407295,
+      "short_name": "B",
+      "spell": "4:3-4:4|4:3-4:9|2|-1",
+      "type": 11569259296725656241,
       "kind": 22,
       "parent_kind": 10,
       "storage": 0,
       "declarations": [],
       "uses": []
     }, {
-      "usr": 15962370213938840720,
-      "detailed_name": "Foo::B = 20",
+      "usr": 14764555744278245583,
+      "detailed_name": "Foo::A",
       "qual_name_offset": 0,
-      "short_name": "B",
-      "spell": "4:3-4:4|4:3-4:9|1026|-1",
-      "type": 16985894625255407295,
+      "short_name": "A",
+      "spell": "3:3-3:4|3:3-3:4|2|-1",
+      "type": 11569259296725656241,
       "kind": 22,
       "parent_kind": 10,
       "storage": 0,

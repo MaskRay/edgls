@@ -1,0 +1,83 @@
+--- a/src/symbol_ref.h
++++ b/src/symbol_ref.h
+@@ -132,6 +132,22 @@
+ 
+ extern void db_symbol_ref_kind(a_symbol_reference_kind  kind);
+ 
++/*
++If non-NULL, called for every declaration and reference that would be written
++to the cross-reference file, whether or not one is being generated.  This
++allows a program using the front end as a library (e.g., an indexer) to observe
++symbol references as they are recorded.
++*/
++typedef void a_symbol_reference_callback(a_symbol_reference_kind srk_flags,
++                                         a_symbol_ptr            sym_ptr,
++                                         a_source_position       *source_position);
++typedef a_symbol_reference_callback *a_symbol_reference_callback_ptr;
++extern EDG_THREAD a_symbol_reference_callback_ptr symbol_reference_callback;
++
++/* TRUE if cross-reference entries are being written or observed. */
++#define xref_info_needed() \
++  (f_xref_info != NULL || symbol_reference_callback != NULL)
++
+ /* Record use information (for cross-reference, etc.). */
+ extern void record_symbol_declaration(
+                             a_symbol_reference_kind      srk_flags,
+--- a/src/symbol_ref.c
++++ b/src/symbol_ref.c
+@@ -30,6 +30,8 @@
+ /* Conditionally open the "edg" namespace. */
+ BEGIN_EDG_NAMESPACE
+ 
++EDG_THREAD a_symbol_reference_callback_ptr symbol_reference_callback = NULL;
++
+ #if DEBUG
+ 
+ void db_symbol_ref_kind(a_symbol_reference_kind  kind)
+@@ -147,6 +149,10 @@
+     /* Ignore symbols for unnamed classes and enums. */
+   } else if (source_position->seq == 0) {
+     /* This symbol is not associated with any particular source position. */
++  } else if (symbol_reference_callback != NULL &&
++             (symbol_reference_callback(srk_flags, sym_ptr, source_position),
++              f_xref_info == NULL)) {
++    /* The callback has observed the entry and no file is being written. */
+   } else {
+     /* The record written to the file is a text line that looks like
+ 
+@@ -2046,7 +2052,7 @@
+      name, regardless of whether it is the primary declaration or not. */
+   if (sym_ptr->decl_seq == 0) set_decl_sequence_number(sym_ptr);
+   /* Update the cross reference file if it exists. */
+-  if (f_xref_info != NULL) {
++  if (xref_info_needed()) {
+     /* If writing cross-reference information, write an entry for this
+        declaration. */
+     write_xref_entry(srk_flags, sym_ptr, source_position);
+@@ -2403,7 +2409,7 @@
+   if (scope_stack_top().in_disambiguation) goto done;
+   /* If writing cross-reference information, write an entry for this
+      declaration. */
+-  if (f_xref_info != NULL) {
++  if (xref_info_needed()) {
+     a_symbol_ptr             sym_for_xref = sym_ptr;
+     a_symbol_reference_kind  kind_for_xref = kind;
+     a_type_ptr               tp;
+@@ -2783,7 +2789,7 @@
+ {
+   a_symbol_locator  loc;
+ 
+-  if (f_xref_info != NULL) {
++  if (xref_info_needed()) {
+     loc = *locator;
+     if (loc.specific_symbol == NULL && !is_error_locator(loc)) {
+       make_specific_symbol_error_locator(&loc);
+@@ -2859,7 +2865,7 @@
+ */
+ {
+   /* Update the cross reference file if it exists. */
+-  if (f_xref_info != NULL) {
++  if (xref_info_needed()) {
+     /* If writing cross-reference information, write an entry for this
+        declaration. */
+     write_xref_entry(SRK_DECLARATION, sym, pos);

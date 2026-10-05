@@ -3,6 +3,7 @@
 
 #include "test.hh"
 
+#include "edg/edg.hh"
 #include "filesystem.hh"
 #include "indexer.hh"
 #include "pipeline.hh"
@@ -243,18 +244,6 @@ IndexFile *findDbForPathEnding(const std::string &path, const std::vector<std::u
 
 bool runIndexTests(const std::string &filter_path, bool enable_update) {
   gTestOutputMode = true;
-  std::string version = LLVM_VERSION_STRING;
-
-  // Index tests change based on the version of clang used.
-  static const char kRequiredClangVersion[] = "24.0.0git";
-  if (version != kRequiredClangVersion && version.find("svn") == std::string::npos) {
-    fprintf(stderr,
-            "Index tests must be run using clang version %s, ccls is running "
-            "with %s\n",
-            kRequiredClangVersion, version.c_str());
-    return false;
-  }
-
   // CCLS_UPDATE_EXPECT=1 regenerates snapshots non-interactively (no TTY
   // required), useful for CI and headless runs.
   bool success = true;
@@ -280,12 +269,13 @@ bool runIndexTests(const std::string &filter_path, bool enable_update) {
         lines_with_endings.push_back(line);
     }
     TextReplacer text_replacer;
-    std::vector<std::string> args{"-std=c++20", "-resource-dir=" + getDefaultResourceDirectory(), path};
+    std::vector<std::string> args{"c++", "-std=c++20", path};
     std::unordered_map<std::string, std::string> all_expected_output;
     parseTestExpectation(path, lines_with_endings, &text_replacer, &args, &all_expected_output);
 
     // Run test.
     g_config = new Config;
+    edg::setBaseDirectory(getDefaultEdgBaseDirectory());
     VFS vfs;
     WorkingFiles wfiles;
     std::vector<const char *> cargs;

@@ -1,19 +1,16 @@
 // Copyright 2017-2018 ccls Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "clang_tu.hh"
 #include "hierarchy.hh"
 #include "message_handler.hh"
 #include "pipeline.hh"
 #include "query.hh"
 
-#include <clang/AST/Type.h>
 #include <llvm/ADT/DenseSet.h>
 
 #include <unordered_set>
 
 namespace ccls {
-using namespace clang;
 
 namespace {
 struct Param : TextDocumentPositionParam {
@@ -90,10 +87,6 @@ void doField(MessageHandler *m, Out_cclsMember *entry, const QueryVar &var, int6
 
 // Expand a type node by adding members recursively to it.
 bool expand(MessageHandler *m, Out_cclsMember *entry, bool qualified, int levels, Kind memberKind) {
-  if (0 < entry->usr && entry->usr <= BuiltinType::LastKind) {
-    entry->name = clangBuiltinTypeName(int(entry->usr));
-    return true;
-  }
   const QueryType *type = &m->db->getType(entry->usr);
   const QueryType::Def *def = type->anyDef();
   // builtin types have no declaration and empty |qualified|.

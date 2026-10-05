@@ -9,7 +9,7 @@ OUTPUT:
   "includes": [],
   "skipped_ranges": [],
   "usr2func": [{
-      "usr": 4259594751088586730,
+      "usr": 9608532274827022249,
       "detailed_name": "void foo()",
       "qual_name_offset": 5,
       "short_name": "foo",
@@ -21,16 +21,16 @@ OUTPUT:
       "storage": 0,
       "declarations": ["1:6-1:9|1:1-1:11|1|-1"],
       "derived": [],
-      "uses": ["4:3-4:6|16420|-1"]
+      "uses": ["4:3-4:6|36|-1"]
     }, {
-      "usr": 6767773193109753523,
+      "usr": 15590769424229303502,
       "detailed_name": "void usage()",
       "qual_name_offset": 5,
       "short_name": "usage",
       "spell": "3:6-3:11|3:1-5:2|2|-1",
       "bases": [],
       "vars": [],
-      "callees": ["4:3-4:6|4259594751088586730|3|16420"],
+      "callees": ["4:3-4:6|9608532274827022249|3|36"],
       "kind": 12,
       "parent_kind": 1,
       "storage": 0,

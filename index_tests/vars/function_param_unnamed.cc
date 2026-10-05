@@ -5,7 +5,7 @@ OUTPUT:
   "includes": [],
   "skipped_ranges": [],
   "usr2func": [{
-      "usr": 2747674671862363334,
+      "usr": 9186792343463881929,
       "detailed_name": "void foo(int, int)",
       "qual_name_offset": 5,
       "short_name": "foo",

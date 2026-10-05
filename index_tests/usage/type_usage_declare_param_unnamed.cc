@@ -6,7 +6,7 @@ OUTPUT:
   "includes": [],
   "skipped_ranges": [],
   "usr2func": [{
-      "usr": 15327735280790448926,
+      "usr": 17765796114341775661,
       "detailed_name": "void foo(ForwardType *)",
       "qual_name_offset": 5,
       "short_name": "foo",
@@ -22,7 +22,7 @@ OUTPUT:
       "uses": []
     }],
   "usr2type": [{
-      "usr": 13749354388332789217,
+      "usr": 16819242541367499852,
       "detailed_name": "struct ForwardType",
       "qual_name_offset": 7,
       "short_name": "ForwardType",

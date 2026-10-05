@@ -8,11 +8,11 @@ OUTPUT:
   "includes": [],
   "skipped_ranges": [],
   "usr2func": [{
-      "usr": 243328841292951622,
+      "usr": 1248060485279433359,
       "detailed_name": "void hello::foo()",
       "qual_name_offset": 5,
       "short_name": "foo",
-      "spell": "2:6-2:9|2:1-2:14|1026|-1",
+      "spell": "2:6-2:9|2:1-2:14|2|-1",
       "bases": [],
       "vars": [],
       "callees": [],
@@ -24,12 +24,12 @@ OUTPUT:
       "uses": []
     }],
   "usr2type": [{
-      "usr": 2029211996748007610,
+      "usr": 9568013184638781012,
       "detailed_name": "namespace hello {}",
       "qual_name_offset": 10,
       "short_name": "hello",
       "bases": [],
-      "funcs": [243328841292951622],
+      "funcs": [1248060485279433359],
       "types": [],
       "vars": [],
       "alias_of": 0,

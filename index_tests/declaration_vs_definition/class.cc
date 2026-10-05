@@ -12,7 +12,7 @@ OUTPUT:
   "skipped_ranges": [],
   "usr2func": [],
   "usr2type": [{
-      "usr": 15041163540773201510,
+      "usr": 11569259296725656241,
       "detailed_name": "class Foo {}",
       "qual_name_offset": 6,
       "short_name": "Foo",

@@ -8,23 +8,7 @@ OUTPUT:
   "skipped_ranges": [],
   "usr2func": [],
   "usr2type": [{
-      "usr": 472,
-      "detailed_name": "",
-      "qual_name_offset": 0,
-      "short_name": "",
-      "bases": [],
-      "funcs": [],
-      "types": [],
-      "vars": [],
-      "alias_of": 0,
-      "kind": 0,
-      "parent_kind": 0,
-      "declarations": [],
-      "derived": [],
-      "instances": [5844987037615239736],
-      "uses": []
-    }, {
-      "usr": 15041163540773201510,
+      "usr": 11569259296725656241,
       "detailed_name": "class Foo {}",
       "qual_name_offset": 6,
       "short_name": "Foo",
@@ -42,15 +26,15 @@ OUTPUT:
       "uses": []
     }],
   "usr2var": [{
-      "usr": 5844987037615239736,
+      "usr": 17135586093725838119,
       "detailed_name": "static int Foo::member",
       "qual_name_offset": 11,
       "short_name": "member",
-      "type": 472,
+      "type": 0,
       "kind": 8,
-      "parent_kind": 5,
-      "storage": 2,
-      "declarations": ["2:14-2:20|2:3-2:20|1025|-1"],
+      "parent_kind": 0,
+      "storage": 1,
+      "declarations": ["2:14-2:20|2:3-2:20|1|-1"],
       "uses": []
     }]
 }

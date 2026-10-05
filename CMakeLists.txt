@@ -1,10 +1,10 @@
-cmake_minimum_required(VERSION 3.8)
-project(ccls LANGUAGES CXX C)
+cmake_minimum_required(VERSION 3.21)
+project(edgls LANGUAGES CXX C)
 
 option(USE_SYSTEM_RAPIDJSON "Use system RapidJSON instead of the git submodule if exists" ON)
 
 # Sources for the executable are specified at end of CMakeLists.txt
-add_executable(ccls "")
+add_executable(edgls "")
 
 ### Default build type
 
@@ -26,14 +26,14 @@ endif()
 ### Compile options
 
 # Enable C++17 (Required)
-set_property(TARGET ccls PROPERTY CXX_STANDARD 17)
-set_property(TARGET ccls PROPERTY CXX_STANDARD_REQUIRED ON)
-set_property(TARGET ccls PROPERTY CXX_EXTENSIONS OFF)
+set_property(TARGET edgls PROPERTY CXX_STANDARD 17)
+set_property(TARGET edgls PROPERTY CXX_STANDARD_REQUIRED ON)
+set_property(TARGET edgls PROPERTY CXX_EXTENSIONS OFF)
 
 # CMake sets MSVC for both MSVC and Clang(Windows)
 if(MSVC)
   # Common MSVC/Clang(Windows) options
-  target_compile_options(ccls PRIVATE
+  target_compile_options(edgls PRIVATE
     /nologo
     /EHsc
     /D_CRT_SECURE_NO_WARNINGS # don't try to use MSVC std replacements
@@ -49,81 +49,62 @@ if(MSVC)
     $<$<CONFIG:Debug>:/FS>
   )
   # relink system libs
-  target_link_libraries(ccls PRIVATE Mincore.lib)
+  target_link_libraries(edgls PRIVATE Mincore.lib)
 else()
   # Common GCC/Clang(Linux) options
-  target_compile_options(ccls PRIVATE
+  target_compile_options(edgls PRIVATE
                          -Wall
                          -Wno-sign-compare
                          )
 
   if(${CMAKE_CXX_COMPILER_ID} STREQUAL GNU)
-    target_compile_options(ccls PRIVATE -Wno-return-type -Wno-unused-result)
+    target_compile_options(edgls PRIVATE -Wno-return-type -Wno-unused-result)
   endif()
 
   if(${CMAKE_CXX_COMPILER_ID} STREQUAL Clang)
-    target_compile_options(ccls PRIVATE
+    target_compile_options(edgls PRIVATE
                            $<$<CONFIG:Debug>:-fno-limit-debug-info>)
   endif()
 endif()
 
 ### Libraries
 
-find_package(Clang REQUIRED)
+find_package(LLVM REQUIRED CONFIG)
+message(STATUS "Using LLVM ${LLVM_PACKAGE_VERSION} from ${LLVM_DIR}")
 
-if(CLANG_LINK_CLANG_DYLIB)
-  target_link_libraries(ccls PRIVATE clang-cpp)
-else()
-  target_link_libraries(ccls PRIVATE
-    clangIndex
-    clangFormat
-    clangTooling
-    clangToolingInclusions
-    clangToolingCore
-    clangFrontend
-    clangParse
-    clangSerialization
-    clangSema
-    clangAST
-    clangLex
-    clangDriver
-    clangBasic
-  )
-  if(LLVM_VERSION_MAJOR GREATER_EQUAL 23) # llvmorg-22-init-27296-g65cb738ff419
-    target_link_libraries(ccls PRIVATE clangUnifiedSymbolResolution)
-  endif()
-endif()
+include(cmake/EDG.cmake)
+target_link_libraries(edgls PRIVATE edgfe)
 
 if(LLVM_LINK_LLVM_DYLIB)
-  target_link_libraries(ccls PRIVATE LLVM)
+  target_link_libraries(edgls PRIVATE LLVM)
 else()
-  target_link_libraries(ccls PRIVATE LLVMOption LLVMSupport)
+  target_link_libraries(edgls PRIVATE LLVMOption LLVMSupport)
   if(LLVM_VERSION_MAJOR GREATER_EQUAL 16) # llvmorg-16-init-15123-gf09cf34d0062
-    target_link_libraries(ccls PRIVATE LLVMTargetParser)
+    target_link_libraries(edgls PRIVATE LLVMTargetParser)
   endif()
 endif()
 
 if(NOT LLVM_ENABLE_RTTI)
   # releases.llvm.org libraries are compiled with -fno-rtti
-  # The mismatch between lib{clang,LLVM}* and ccls can make libstdc++ std::make_shared return nullptr
+  # The mismatch between libLLVM* and edgls can make libstdc++ std::make_shared return nullptr
   # _Sp_counted_ptr_inplace::_M_get_deleter
   if(MSVC)
-    target_compile_options(ccls PRIVATE /GR-)
+    target_compile_options(edgls PRIVATE /GR-)
   else()
-    target_compile_options(ccls PRIVATE -fno-rtti)
+    target_compile_options(edgls PRIVATE -fno-rtti)
   endif()
 endif()
 
 # Enable threading support
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-target_link_libraries(ccls PRIVATE Threads::Threads)
+target_link_libraries(edgls PRIVATE Threads::Threads)
 
 if(${CMAKE_SYSTEM_NAME} STREQUAL FreeBSD)
   find_package(Backtrace REQUIRED)
-  target_link_libraries(ccls PRIVATE ${Backtrace_LIBRARIES})
+  target_link_libraries(edgls PRIVATE ${Backtrace_LIBRARIES})
   # src/platform_posix.cc uses libthr
-  target_link_libraries(ccls PRIVATE thr)
+  target_link_libraries(edgls PRIVATE thr)
 endif()
 
 if(LLVM_ENABLE_ZLIB)
@@ -132,30 +113,8 @@ endif()
 
 ### Definitions
 
-# Find Clang resource directory with Clang executable.
-
-if(NOT CLANG_RESOURCE_DIR)
-  find_program(CLANG_EXECUTABLE clang)
-  if(NOT CLANG_EXECUTABLE)
-    message(FATAL_ERROR "clang executable not found.")
-  endif()
-
-  execute_process(
-    COMMAND ${CLANG_EXECUTABLE} -print-resource-dir
-    RESULT_VARIABLE CLANG_FIND_RESOURCE_DIR_RESULT
-    OUTPUT_VARIABLE CLANG_RESOURCE_DIR
-    ERROR_VARIABLE CLANG_FIND_RESOURCE_DIR_ERROR
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
-
-  if(CLANG_FIND_RESOURCE_DIR_RESULT)
-    message(FATAL_ERROR "Error retrieving Clang resource directory with Clang \
-            executable. Output:\n ${CLANG_FIND_RESOURCE_DIR_ERROR}")
-  endif()
-endif()
-
 set_property(SOURCE src/utils.cc APPEND PROPERTY COMPILE_DEFINITIONS
-             CLANG_RESOURCE_DIRECTORY=R"\(${CLANG_RESOURCE_DIR}\)")
+             EDG_BASE_DIRECTORY=R"\(${EDG_DEFAULT_BASE}\)")
 
 ### Includes
 
@@ -177,30 +136,31 @@ if(NOT RapidJSON_FOUND)
   endif()
 endif()
 
-target_include_directories(ccls PRIVATE src)
+target_include_directories(edgls PRIVATE src)
 
 foreach(include_dir third_party
-    ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS} ${RapidJSON_INCLUDE_DIRS})
+    ${LLVM_INCLUDE_DIRS} ${RapidJSON_INCLUDE_DIRS})
   get_filename_component(include_dir_realpath ${include_dir} REALPATH)
   # Don't add as SYSTEM if they are in CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES.
   # It would reorder the system search paths and cause issues with libstdc++'s
   # use of #include_next. See https://github.com/MaskRay/ccls/pull/417
   if(NOT "${include_dir_realpath}" IN_LIST CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
-    target_include_directories(ccls SYSTEM PRIVATE ${include_dir})
+    target_include_directories(edgls SYSTEM PRIVATE ${include_dir})
   endif()
 endforeach()
 
 ### Install
 
-install(TARGETS ccls RUNTIME DESTINATION bin)
+install(TARGETS edgls RUNTIME DESTINATION bin)
 
 ### Sources
 
-target_sources(ccls PRIVATE third_party/siphash.cc)
+target_sources(edgls PRIVATE third_party/siphash.cc)
 
-target_sources(ccls PRIVATE
-  src/clang_tu.cc
+target_sources(edgls PRIVATE
   src/config.cc
+  src/edg/edg.cc
+  src/edg_args.cc
   src/filesystem.cc
   src/fuzzy_match.cc
   src/main.cc
@@ -221,7 +181,7 @@ target_sources(ccls PRIVATE
   src/working_files.cc
 )
 
-target_sources(ccls PRIVATE
+target_sources(edgls PRIVATE
   src/messages/ccls_call.cc
   src/messages/ccls_info.cc
   src/messages/ccls_inheritance.cc

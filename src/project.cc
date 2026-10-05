@@ -3,7 +3,6 @@
 
 #include "project.hh"
 
-#include "clang_tu.hh" // llvm::vfs
 #include "filesystem.hh"
 #include "log.hh"
 #include "pipeline.hh"
@@ -11,17 +10,15 @@
 #include "utils.hh"
 #include "working_files.hh"
 
-#include <clang/Driver/Compilation.h>
-#include <clang/Driver/Driver.h>
-#include <clang/Driver/Types.h>
-#include <clang/Frontend/CompilerInstance.h>
-#include <clang/Tooling/CompilationDatabase.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/StringSet.h>
 #include <llvm/Support/GlobPattern.h>
 #include <llvm/Support/LineIterator.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/Program.h>
 
+#include <rapidjson/document.h>
 #include <rapidjson/writer.h>
 
 #ifdef _WIN32
@@ -35,25 +32,33 @@
 #include <unordered_set>
 #include <vector>
 
-using namespace clang;
 using namespace llvm;
 
 namespace ccls {
 std::pair<LanguageId, bool> lookupExtension(std::string_view filename) {
-  using namespace clang::driver;
-  auto i = types::lookupTypeForExtension(sys::path::extension({filename.data(), filename.size()}).substr(1));
-  bool header = i == types::TY_CHeader || i == types::TY_CXXHeader || i == types::TY_ObjCXXHeader;
-  bool objc = types::isObjC(i);
-  LanguageId ret;
-  if (types::isCXX(i))
-    ret = types::isCuda(i) ? LanguageId::Cuda : objc ? LanguageId::ObjCpp : LanguageId::Cpp;
-  else if (objc)
-    ret = LanguageId::ObjC;
-  else if (i == types::TY_C || i == types::TY_CHeader)
-    ret = LanguageId::C;
-  else
-    ret = LanguageId::Unknown;
-  return {ret, header};
+  StringRef ext = sys::path::extension({filename.data(), filename.size()});
+  if (ext.empty())
+    return {LanguageId::Unknown, false};
+  ext = ext.drop_front();
+  if (ext == "c")
+    return {LanguageId::C, false};
+  if (ext == "h")
+    return {LanguageId::C, true};
+  if (ext == "cc" || ext == "cpp" || ext == "cxx" || ext == "c++" || ext == "C" || ext == "cp" || ext == "CPP" ||
+      ext == "ixx" || ext == "cppm" || ext == "ccm" || ext == "cxxm" || ext == "c++m")
+    return {LanguageId::Cpp, false};
+  if (ext == "hh" || ext == "hpp" || ext == "hxx" || ext == "h++" || ext == "H" || ext == "inl" || ext == "ipp" ||
+      ext == "tcc" || ext == "txx")
+    return {LanguageId::Cpp, true};
+  if (ext == "cu")
+    return {LanguageId::Cuda, false};
+  if (ext == "cuh")
+    return {LanguageId::Cuda, true};
+  if (ext == "m")
+    return {LanguageId::ObjC, false};
+  if (ext == "mm")
+    return {LanguageId::ObjCpp, false};
+  return {LanguageId::Unknown, false};
 }
 
 namespace {
@@ -149,11 +154,105 @@ bool appendToCDB(const std::vector<const char *> &args) {
 }
 
 std::vector<const char *> getFallback(const std::string &path) {
-  std::vector<const char *> argv{"clang"};
+  std::vector<const char *> argv{"c++"};
   if (sys::path::extension(path) == ".h")
-    argv.push_back("-xobjective-c++-header");
+    argv.push_back("-xc++-header");
   argv.push_back(intern(path));
   return argv;
+}
+
+// Split a command line like a POSIX shell (without expansions).
+std::vector<std::string> splitCommandLine(StringRef cmd) {
+  std::vector<std::string> ret;
+  std::string cur;
+  bool has = false;
+  for (size_t i = 0; i < cmd.size(); i++) {
+    char c = cmd[i];
+    if (c == '\\' && i + 1 < cmd.size()) {
+      cur += cmd[++i];
+      has = true;
+    } else if (c == '\'') {
+      size_t e = cmd.find('\'', i + 1);
+      if (e == StringRef::npos)
+        e = cmd.size();
+      cur += cmd.slice(i + 1, e);
+      i = e;
+      has = true;
+    } else if (c == '"') {
+      for (i++; i < cmd.size() && cmd[i] != '"'; i++) {
+        if (cmd[i] == '\\' && i + 1 < cmd.size() && StringRef("\\\"$`").contains(cmd[i + 1]))
+          i++;
+        cur += cmd[i];
+      }
+      has = true;
+    } else if (isspace((unsigned char)c)) {
+      if (has)
+        ret.push_back(std::move(cur));
+      cur.clear();
+      has = false;
+    } else {
+      cur += c;
+      has = true;
+    }
+  }
+  if (has)
+    ret.push_back(std::move(cur));
+  return ret;
+}
+
+// Expand response files (@file), which build systems use for long command
+// lines.
+void expandResponseFiles(std::vector<std::string> &args, const std::string &directory, int depth = 0) {
+  for (size_t i = 0; i < args.size(); i++) {
+    if (args[i].size() < 2 || args[i][0] != '@' || depth > 8)
+      continue;
+    std::optional<std::string> content = readContent(resolveIfRelative(directory, args[i].substr(1)));
+    if (!content)
+      continue;
+    std::vector<std::string> expanded = splitCommandLine(*content);
+    expandResponseFiles(expanded, directory, depth + 1);
+    args.erase(args.begin() + i);
+    args.insert(args.begin() + i, expanded.begin(), expanded.end());
+    i += expanded.size() - 1;
+  }
+}
+
+struct CompileCommand {
+  std::string directory, filename;
+  std::vector<std::string> args;
+};
+
+std::optional<std::vector<CompileCommand>> loadCompileCommands(const std::string &path) {
+  std::optional<std::string> content = readContent(path);
+  if (!content)
+    return std::nullopt;
+  rapidjson::Document doc;
+  doc.Parse(content->c_str());
+  if (doc.HasParseError() || !doc.IsArray())
+    return std::nullopt;
+  std::vector<CompileCommand> ret;
+  for (auto &entry : doc.GetArray()) {
+    if (!entry.IsObject())
+      continue;
+    CompileCommand cmd;
+    auto dir = entry.FindMember("directory"), file = entry.FindMember("file");
+    if (dir == entry.MemberEnd() || file == entry.MemberEnd() || !dir->value.IsString() || !file->value.IsString())
+      continue;
+    cmd.directory = dir->value.GetString();
+    cmd.filename = file->value.GetString();
+    if (auto args = entry.FindMember("arguments"); args != entry.MemberEnd() && args->value.IsArray()) {
+      for (auto &a : args->value.GetArray())
+        if (a.IsString())
+          cmd.args.push_back(a.GetString());
+    } else if (auto command = entry.FindMember("command");
+               command != entry.MemberEnd() && command->value.IsString()) {
+      cmd.args = splitCommandLine(command->value.GetString());
+    }
+    expandResponseFiles(cmd.args, cmd.directory);
+    if (cmd.args.size())
+      ret.push_back(std::move(cmd));
+  }
+  return ret;
 }
 
 void loadDirectoryListing(ProjectProcessor &proc, const std::string &root, const StringSet<> &seen) {
@@ -311,7 +410,7 @@ void Project::loadDirectory(const std::string &root, Project::Folder &folder) {
     }
   }
 
-  std::unique_ptr<tooling::CompilationDatabase> cdb = tooling::CompilationDatabase::loadFromDirectory(cdbDir, err_msg);
+  std::optional<std::vector<CompileCommand>> cdb = loadCompileCommands(std::string(path));
   if (!g_config->compilationDatabaseCommand.empty()) {
 #ifdef _WIN32
     DeleteFileA(stdinPath.c_str());
@@ -332,23 +431,23 @@ void Project::loadDirectory(const std::string &root, Project::Folder &folder) {
       LOG_S(ERROR) << "failed to load " << path.c_str();
   } else {
     LOG_S(INFO) << "loaded " << path.c_str();
-    for (tooling::CompileCommand &cmd : cdb->getAllCompileCommands()) {
+    for (CompileCommand &cmd : *cdb) {
       Project::Entry entry;
       entry.root = root;
       doPathMapping(entry.root);
 
       // If workspace folder is real/ but entries use symlink/, convert to
       // real/.
-      entry.directory = realPath(resolveIfRelative(root, cmd.Directory));
+      entry.directory = realPath(resolveIfRelative(root, cmd.directory));
       entry.directory.push_back('/');
       normalizeFolder(entry.directory);
       entry.directory.pop_back();
       doPathMapping(entry.directory);
-      entry.filename = realPath(resolveIfRelative(entry.directory, cmd.Filename));
+      entry.filename = realPath(resolveIfRelative(entry.directory, cmd.filename));
       normalizeFolder(entry.filename);
       doPathMapping(entry.filename);
 
-      std::vector<std::string> args = std::move(cmd.CommandLine);
+      std::vector<std::string> args = std::move(cmd.args);
       entry.args.reserve(args.size());
       for (int i = 0; i < args.size(); i++) {
         doPathMapping(args[i]);

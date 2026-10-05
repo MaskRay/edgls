@@ -7,7 +7,7 @@ OUTPUT:
   "skipped_ranges": [],
   "usr2func": [],
   "usr2type": [{
-      "usr": 13487927231218873822,
+      "usr": 15323574594624129250,
       "detailed_name": "struct Type {}",
       "qual_name_offset": 7,
       "short_name": "Type",
@@ -21,16 +21,16 @@ OUTPUT:
       "parent_kind": 1,
       "declarations": [],
       "derived": [],
-      "instances": [6601831367240627080],
+      "instances": [16843970162298630736],
       "uses": ["2:8-2:12|4|-1"]
     }],
   "usr2var": [{
-      "usr": 6601831367240627080,
+      "usr": 16843970162298630736,
       "detailed_name": "static Type t",
       "qual_name_offset": 12,
       "short_name": "t",
       "spell": "2:13-2:14|2:1-2:14|2|-1",
-      "type": 13487927231218873822,
+      "type": 15323574594624129250,
       "kind": 13,
       "parent_kind": 1,
       "storage": 2,

@@ -4,11 +4,7 @@
 #include "message_handler.hh"
 #include "query.hh"
 
-#include <clang/Basic/CharInfo.h>
-
 #include <unordered_set>
-
-using namespace clang;
 
 namespace ccls {
 namespace {

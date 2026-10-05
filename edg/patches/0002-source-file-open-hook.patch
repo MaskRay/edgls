@@ -1,0 +1,59 @@
+--- a/src/host_envir.h
++++ b/src/host_envir.h
+@@ -3646,6 +3646,14 @@
+ /* Get path subsets. */
+ extern a_const_char *get_base_name(a_const_char *file_name);
+ 
++/*
++If non-NULL, called before a source file is opened.  A non-NULL result is used
++in place of opening file_name from the file system (e.g., to supply the
++contents of an unsaved editor buffer).
++*/
++typedef FILE *a_source_file_open_hook(a_const_char *file_name);
++extern EDG_THREAD a_source_file_open_hook *source_file_open_hook;
++
+ /* Open a source file. */
+ extern
+ FILE *open_source_file(a_const_char          *file_name,
+--- a/src/host_envir.c
++++ b/src/host_envir.c
+@@ -1573,6 +1573,9 @@
+ }  /* fopen_with_result */
+ 
+ 
++EDG_THREAD a_source_file_open_hook *source_file_open_hook = NULL;
++
++
+ FILE *open_source_file(a_const_char          *file_name,
+ 		       an_open_file_result   *open_result,
+                        a_unicode_source_kind *unicode_source_kind)
+@@ -1592,7 +1595,13 @@
+   }  /* if */
+ #endif /* DEBUG */
+   *unicode_source_kind = usk_none;
+-  temp_file = fopen_with_result(file_name, FOPEN_MODE_FOR_READ, open_result);
++  if (source_file_open_hook != NULL &&
++      (temp_file = source_file_open_hook(file_name)) != NULL) {
++    clear_open_file_result(open_result);
++  } else {
++    temp_file = fopen_with_result(file_name, FOPEN_MODE_FOR_READ,
++                                  open_result);
++  }  /* if */
+ #if UNICODE_SOURCE_SUPPORTED
+   if (temp_file != NULL) {
+     /* If the file contains a byte order mark, advance past it. */
+@@ -1620,7 +1629,13 @@
+ {
+   FILE	*temp_file;
+ 
+-  temp_file = fopen_interface(file_name, FOPEN_MODE_FOR_READ);
++  temp_file = NULL;
++  if (source_file_open_hook != NULL) {
++    temp_file = source_file_open_hook(file_name);
++  }  /* if */
++  if (temp_file == NULL) {
++    temp_file = fopen_interface(file_name, FOPEN_MODE_FOR_READ);
++  }  /* if */
+   *unicode_source_kind = usk_none;
+ #if UNICODE_SOURCE_SUPPORTED
+   /* If the file contains a byte order mark, advance past it. */

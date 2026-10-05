@@ -5,19 +5,16 @@
 #include "log.hh"
 #include "message_handler.hh"
 #include "pipeline.hh"
+#include "query.hh"
 #include "sema_manager.hh"
 #include "working_files.hh"
 
-#include <clang/Sema/CodeCompleteConsumer.h>
-#include <clang/Sema/Sema.h>
-#include <llvm/ADT/Twine.h>
+#include <llvm/ADT/DenseSet.h>
+#include <llvm/ADT/StringRef.h>
 
-#if LLVM_VERSION_MAJOR >= 18 // llvmorg-18-init-10631-gedd690b02e16
-#define TTK_Struct TagTypeKind::Struct
-#endif
+#include <unordered_set>
 
 namespace ccls {
-using namespace clang;
 using namespace llvm;
 
 REFLECT_UNDERLYING(InsertTextFormat);
@@ -72,41 +69,12 @@ void filterCandidates(CompletionList &result, const std::string &complete_text, 
       result.isIncomplete = true;
     }
 
-    int overwrite_len = 0;
-    for (auto &item : items) {
-      auto &edits = item.additionalTextEdits;
-      if (edits.size() && edits[0].range.end == begin_pos) {
-        Position start = edits[0].range.start, end = edits[0].range.end;
-        if (start.line == begin_pos.line) {
-          overwrite_len = std::max(overwrite_len, end.character - start.character);
-        } else {
-          overwrite_len = -1;
-          break;
-        }
-      }
-    }
-
-    Position overwrite_begin = {begin_pos.line, begin_pos.character - overwrite_len};
     std::string sort(4, ' ');
     for (auto &item : items) {
       item.textEdit.range = lsRange{begin_pos, end_pos};
-      if (has_open_paren)
+      if (has_open_paren) {
         item.textEdit.newText = item.filterText;
-      // https://github.com/Microsoft/language-server-protocol/issues/543
-      // Order of textEdit and additionalTextEdits is unspecified.
-      auto &edits = item.additionalTextEdits;
-      if (overwrite_len > 0) {
-        item.textEdit.range.start = overwrite_begin;
-        std::string orig = buffer_line.substr(overwrite_begin.character, overwrite_len);
-        if (edits.size() && edits[0].range.end == begin_pos && edits[0].range.start.line == begin_pos.line) {
-          int cur_edit_len = edits[0].range.end.character - edits[0].range.start.character;
-          item.textEdit.newText = buffer_line.substr(overwrite_begin.character, overwrite_len - cur_edit_len) +
-                                  edits[0].newText + item.textEdit.newText;
-          edits.erase(edits.begin());
-        } else {
-          item.textEdit.newText = orig + item.textEdit.newText;
-        }
-        item.filterText = orig + item.filterText;
+        item.insertTextFormat = InsertTextFormat::PlainText;
       }
       if (item.filterText == item.label)
         item.filterText.clear();
@@ -135,14 +103,11 @@ void filterCandidates(CompletionList &result, const std::string &complete_text, 
                 items.end());
   }
   std::sort(items.begin(), items.end(), [](const CompletionItem &lhs, const CompletionItem &rhs) {
-    int t = int(lhs.additionalTextEdits.size() - rhs.additionalTextEdits.size());
-    if (t)
-      return t < 0;
     if (lhs.score_ != rhs.score_)
       return lhs.score_ > rhs.score_;
     if (lhs.priority_ != rhs.priority_)
       return lhs.priority_ < rhs.priority_;
-    t = lhs.textEdit.newText.compare(rhs.textEdit.newText);
+    int t = lhs.textEdit.newText.compare(rhs.textEdit.newText);
     if (t)
       return t < 0;
     t = lhs.label.compare(rhs.label);
@@ -155,257 +120,169 @@ void filterCandidates(CompletionList &result, const std::string &complete_text, 
   finalize();
 }
 
-CompletionItemKind getCompletionKind(CodeCompletionContext::Kind k, const CodeCompletionResult &r) {
-  switch (r.Kind) {
-  case CodeCompletionResult::RK_Declaration: {
-    const Decl *d = r.Declaration;
-    switch (d->getKind()) {
-    case Decl::LinkageSpec:
-      return CompletionItemKind::Keyword;
-    case Decl::Namespace:
-    case Decl::NamespaceAlias:
-      return CompletionItemKind::Module;
-    case Decl::ObjCCategory:
-    case Decl::ObjCCategoryImpl:
-    case Decl::ObjCImplementation:
-    case Decl::ObjCInterface:
-    case Decl::ObjCProtocol:
-      return CompletionItemKind::Interface;
-    case Decl::ObjCMethod:
-      return CompletionItemKind::Method;
-    case Decl::ObjCProperty:
-      return CompletionItemKind::Property;
-    case Decl::ClassTemplate:
-      return CompletionItemKind::Class;
-    case Decl::FunctionTemplate:
-      return CompletionItemKind::Function;
-    case Decl::TypeAliasTemplate:
-      return CompletionItemKind::Class;
-    case Decl::VarTemplate:
-      if (cast<VarTemplateDecl>(d)->getTemplatedDecl()->isConstexpr())
-        return CompletionItemKind::Constant;
-      return CompletionItemKind::Variable;
-    case Decl::TemplateTemplateParm:
-      return CompletionItemKind::TypeParameter;
-    case Decl::Enum:
-      return CompletionItemKind::Enum;
-    case Decl::CXXRecord:
-    case Decl::Record:
-      if (auto *rd = dyn_cast<RecordDecl>(d))
-        if (rd->getTagKind() == TTK_Struct)
-          return CompletionItemKind::Struct;
-      return CompletionItemKind::Class;
-    case Decl::TemplateTypeParm:
-    case Decl::TypeAlias:
-    case Decl::Typedef:
-      return CompletionItemKind::TypeParameter;
-    case Decl::Using:
-    case Decl::ConstructorUsingShadow:
-      return CompletionItemKind::Keyword;
-    case Decl::Binding:
-      return CompletionItemKind::Variable;
-    case Decl::Field:
-    case Decl::ObjCIvar:
-      return CompletionItemKind::Field;
-    case Decl::Function:
-      return CompletionItemKind::Function;
-    case Decl::CXXMethod:
-      return CompletionItemKind::Method;
-    case Decl::CXXConstructor:
-      return CompletionItemKind::Constructor;
-    case Decl::CXXConversion:
-    case Decl::CXXDestructor:
-      return CompletionItemKind::Method;
-    case Decl::Var:
-    case Decl::Decomposition:
-    case Decl::ImplicitParam:
-    case Decl::ParmVar:
-    case Decl::VarTemplateSpecialization:
-    case Decl::VarTemplatePartialSpecialization:
-      if (cast<VarDecl>(d)->isConstexpr())
-        return CompletionItemKind::Constant;
-      return CompletionItemKind::Variable;
-    case Decl::EnumConstant:
-      return CompletionItemKind::EnumMember;
-    case Decl::IndirectField:
-      return CompletionItemKind::Field;
-
-    default:
-      LOG_S(WARNING) << "Unhandled " << int(d->getKind());
-      return CompletionItemKind::Text;
-    }
-    break;
-  }
-  case CodeCompletionResult::RK_Keyword:
-    return CompletionItemKind::Keyword;
-  case CodeCompletionResult::RK_Macro:
+CompletionItemKind toCompletionKind(SymbolKind k) {
+  switch (k) {
+  case SymbolKind::Namespace:
+    return CompletionItemKind::Module;
+  case SymbolKind::Class:
+    return CompletionItemKind::Class;
+  case SymbolKind::Struct:
+    return CompletionItemKind::Struct;
+  case SymbolKind::Enum:
+    return CompletionItemKind::Enum;
+  case SymbolKind::Interface:
+    return CompletionItemKind::Interface;
+  case SymbolKind::TypeAlias:
+  case SymbolKind::TypeParameter:
+    return CompletionItemKind::TypeParameter;
+  case SymbolKind::Method:
+  case SymbolKind::StaticMethod:
+    return CompletionItemKind::Method;
+  case SymbolKind::Constructor:
+    return CompletionItemKind::Constructor;
+  case SymbolKind::Function:
+    return CompletionItemKind::Function;
+  case SymbolKind::Field:
+    return CompletionItemKind::Field;
+  case SymbolKind::EnumMember:
+    return CompletionItemKind::EnumMember;
+  case SymbolKind::Macro:
     return CompletionItemKind::Reference;
-  case CodeCompletionResult::RK_Pattern:
-    if (k == CodeCompletionContext::CCC_IncludedFile)
-      return CompletionItemKind::File;
-    return CompletionItemKind::Snippet;
+  default:
+    return CompletionItemKind::Variable;
   }
 }
 
-void buildItem(const CodeCompletionResult &r, const CodeCompletionString &ccs, std::vector<CompletionItem> &out) {
-  assert(!out.empty());
-  auto first = out.size() - 1;
-  bool ignore = false;
-  std::string result_type;
-
-  for (const auto &chunk : ccs) {
-    CodeCompletionString::ChunkKind kind = chunk.Kind;
-    std::string text;
-    switch (kind) {
-    case CodeCompletionString::CK_TypedText:
-      text = chunk.Text;
-      for (auto i = first; i < out.size(); i++)
-        out[i].filterText = text;
-      break;
-    case CodeCompletionString::CK_Placeholder:
-      text = chunk.Text;
-      for (auto i = first; i < out.size(); i++)
-        out[i].parameters_.push_back(text);
-      break;
-    case CodeCompletionString::CK_Informative:
-      if (StringRef(chunk.Text).endswith("::"))
-        continue;
-      text = chunk.Text;
-      break;
-    case CodeCompletionString::CK_ResultType:
-      result_type = chunk.Text;
-      continue;
-    case CodeCompletionString::CK_CurrentParameter:
-      // This should never be present while collecting completion items.
-      llvm_unreachable("unexpected CK_CurrentParameter");
-      continue;
-    case CodeCompletionString::CK_Optional: {
-      // Duplicate last element, the recursive call will complete it.
-      if (g_config->completion.duplicateOptional) {
-        out.push_back(out.back());
-        buildItem(r, *chunk.Optional, out);
-      }
-      continue;
-    }
-    default:
-      text = chunk.Text;
-      break;
-    }
-
-    for (auto i = first; i < out.size(); ++i) {
-      out[i].label += text;
-      if (ignore || (!g_config->client.snippetSupport && out[i].parameters_.size()))
-        continue;
-
-      if (kind == CodeCompletionString::CK_Placeholder) {
-        if (r.Kind == CodeCompletionResult::RK_Pattern) {
-          ignore = true;
-          continue;
-        }
-        out[i].textEdit.newText += ("${" + Twine(out[i].parameters_.size()) + ":" + text + "}").str();
-        out[i].insertTextFormat = InsertTextFormat::Snippet;
-      } else if (kind != CodeCompletionString::CK_Informative) {
-        out[i].textEdit.newText += text;
-      }
-    }
-  }
-
-  if (result_type.size())
-    for (auto i = first; i < out.size(); ++i) {
-      // ' : ' for variables,
-      // ' -> ' (trailing return type-like) for functions
-      out[i].label += (out[i].label == out[i].filterText ? " : " : " -> ");
-      out[i].label += result_type;
-    }
-}
-
-class CompletionConsumer : public CodeCompleteConsumer {
-  std::shared_ptr<clang::GlobalCodeCompletionAllocator> alloc;
-  CodeCompletionTUInfo cctu_info;
-
-public:
-  bool from_cache;
-  std::vector<CompletionItem> ls_items;
-
-  CompletionConsumer(const CodeCompleteOptions &opts, bool from_cache)
-      : CodeCompleteConsumer(opts), alloc(std::make_shared<clang::GlobalCodeCompletionAllocator>()), cctu_info(alloc),
-        from_cache(from_cache) {}
-
-  void ProcessCodeCompleteResults(Sema &s, CodeCompletionContext context, CodeCompletionResult *results,
-                                  unsigned numResults) override {
-    if (context.getKind() == CodeCompletionContext::CCC_Recovery)
-      return;
-    ls_items.reserve(numResults);
-    for (unsigned i = 0; i != numResults; i++) {
-      auto &r = results[i];
-      if (r.Availability == CXAvailability_NotAccessible || r.Availability == CXAvailability_NotAvailable)
-        continue;
-      if (r.Declaration) {
-        Decl::Kind k = r.Declaration->getKind();
-        if (k == Decl::CXXDestructor)
-          continue;
-        if (k == Decl::FunctionTemplate) {
-          // Ignore CXXDeductionGuide which has empty TypedText.
-          auto *fd = cast<FunctionTemplateDecl>(r.Declaration);
-          if (fd->getTemplatedDecl()->getKind() == Decl::CXXDeductionGuide)
-            continue;
-        }
-        if (auto *rd = dyn_cast<CXXRecordDecl>(r.Declaration))
-          if (rd->isInjectedClassName())
-            continue;
-        auto nk = r.Declaration->getDeclName().getNameKind();
-        if (nk == DeclarationName::CXXOperatorName || nk == DeclarationName::CXXLiteralOperatorName)
-          continue;
-      }
-
-      CodeCompletionString *ccs =
-          r.CreateCodeCompletionString(s, context, getAllocator(), getCodeCompletionTUInfo(), includeBriefComments());
-      CompletionItem ls_item;
-      ls_item.kind = getCompletionKind(context.getKind(), r);
-      if (const char *brief = ccs->getBriefComment())
-        ls_item.documentation = brief;
-      ls_item.detail = ccs->getParentContextName().str();
-
-      size_t first_idx = ls_items.size();
-      ls_items.push_back(ls_item);
-      buildItem(r, *ccs, ls_items);
-
-      for (size_t j = first_idx; j < ls_items.size(); j++) {
-        std::string &s = ls_items[j].textEdit.newText;
-        if (!g_config->client.snippetSupport) {
-          if (s.size()) {
-            // Delete non-identifier parts.
-            if (s.back() == '(' || s.back() == '<')
-              s.pop_back();
-            else if (s.size() >= 2 && !s.compare(s.size() - 2, 2, "()"))
-              s.resize(s.size() - 2);
-          }
-        } else if (ls_items[j].insertTextFormat == InsertTextFormat::Snippet) {
-          if (!g_config->completion.placeholder) {
-            // foo(${1:int a}, ${2:int b}) -> foo($1)$0
-            auto p = s.find("${"), q = s.rfind('}');
-            s.replace(p, q - p + 1, "$1");
-          }
-          s += "$0";
-        }
-        ls_items[j].priority_ = ccs->getPriority();
-        if (!g_config->completion.detailedLabel) {
-          ls_items[j].detail = ls_items[j].label;
-          ls_items[j].label = ls_items[j].filterText;
-        }
-      }
-      for (const FixItHint &fixIt : r.FixIts) {
-        auto &ast = s.getASTContext();
-        TextEdit ls_edit = ccls::toTextEdit(ast.getSourceManager(), ast.getLangOpts(), fixIt);
-        for (size_t j = first_idx; j < ls_items.size(); j++)
-          ls_items[j].additionalTextEdits.push_back(ls_edit);
-      }
-    }
-  }
-
-  CodeCompletionAllocator &getAllocator() override { return *alloc; }
-  CodeCompletionTUInfo &getCodeCompletionTUInfo() override { return cctu_info; }
+const char *const kKeywords[] = {
+    "alignas",   "alignof",  "auto",          "bool",        "break",     "case",      "catch",
+    "char",      "class",    "concept",       "const",       "consteval", "constexpr", "constinit",
+    "continue",  "co_await", "co_return",     "co_yield",    "decltype",  "default",   "delete",
+    "do",        "double",   "dynamic_cast",  "else",        "enum",      "explicit",  "extern",
+    "false",     "float",    "for",           "friend",      "goto",      "if",        "inline",
+    "int",       "long",     "mutable",       "namespace",   "new",       "noexcept",  "nullptr",
+    "operator",  "private",  "protected",     "public",      "register",  "reinterpret_cast",
+    "requires",  "return",   "short",         "signed",      "sizeof",    "static",    "static_assert",
+    "static_cast", "struct", "switch",        "template",    "this",      "thread_local", "throw",
+    "true",      "try",      "typedef",       "typeid",      "typename",  "union",     "unsigned",
+    "using",     "virtual",  "void",          "volatile",    "while",
 };
+
+// Collects candidates from the index.
+struct Collector {
+  DB *db;
+  std::vector<CompletionItem> items;
+  llvm::DenseSet<std::pair<Usr, int>> seen;
+  // Labels of added items; a derived class member hides a base class member.
+  std::unordered_set<std::string> labels;
+
+  template <typename Def> void add(Usr usr, Kind kind, const Def &def, unsigned priority) {
+    if (!seen.insert({usr, int(kind)}).second)
+      return;
+    std::string_view name = def.name(false);
+    if (name.empty() || name[0] == '~' || (name.size() > 8 && name.substr(0, 8) == "operator" &&
+                                           !isAsciiIdentifierContinue(name[8])))
+      return;
+    CompletionItem item;
+    item.label = std::string(name);
+    item.filterText = item.label;
+    item.kind = toCompletionKind(def.kind);
+    item.detail = def.detailed_name;
+    item.documentation = def.comments;
+    item.textEdit.newText = item.label;
+    if (kind == Kind::Func && g_config->client.snippetSupport) {
+      item.textEdit.newText += "($1)$0";
+      item.insertTextFormat = InsertTextFormat::Snippet;
+    }
+    if (g_config->completion.detailedLabel && kind == Kind::Func) {
+      std::string_view detailed = def.detailed_name;
+      size_t paren = detailed.find('(', def.short_name_offset);
+      if (paren != std::string_view::npos) {
+        detailed = detailed.substr(paren);
+        // An overrider hides the overridden function.
+        for (std::string_view suffix : {" = 0", " final", " override"})
+          if (detailed.size() > suffix.size() && detailed.substr(detailed.size() - suffix.size()) == suffix)
+            detailed.remove_suffix(suffix.size());
+        item.label += detailed;
+      }
+    }
+    if (!labels.insert(item.label).second)
+      return;
+    item.priority_ = priority;
+    item.score_ = 0;
+    items.push_back(std::move(item));
+  }
+
+  void addFunc(Usr usr, unsigned priority) {
+    if (!db->hasFunc(usr))
+      return;
+    if (auto *def = db->getFunc(usr).anyDef())
+      if (def->kind != SymbolKind::Constructor)
+        add(usr, Kind::Func, *def, priority);
+  }
+  void addType(Usr usr, unsigned priority) {
+    if (!db->hasType(usr))
+      return;
+    if (auto *def = db->getType(usr).anyDef())
+      add(usr, Kind::Type, *def, priority);
+  }
+  void addVar(Usr usr, unsigned priority) {
+    if (!db->hasVar(usr))
+      return;
+    if (auto *def = db->getVar(usr).anyDef())
+      add(usr, Kind::Var, *def, priority);
+  }
+
+  // Members of a class or namespace, including those of base classes.
+  void addMembers(Usr type_usr, bool types_too, unsigned priority, int depth = 0) {
+    if (depth > 8 || !db->hasType(type_usr))
+      return;
+    QueryType &type = db->getType(type_usr);
+    for (auto &def : type.def) {
+      for (Usr usr : def.funcs)
+        addFunc(usr, priority);
+      for (auto &[usr, _] : def.vars)
+        addVar(usr, priority);
+      if (types_too)
+        for (Usr usr : def.types)
+          addType(usr, priority);
+      if (def.kind != SymbolKind::Namespace)
+        for (Usr base : def.bases)
+          addMembers(base, types_too, priority + 1, depth + 1);
+      if (def.alias_of)
+        addMembers(def.alias_of, types_too, priority, depth + 1);
+    }
+  }
+
+  // The type of a variable, following typedefs to the class.
+  Usr typeOfVar(Usr var_usr) {
+    if (!db->hasVar(var_usr))
+      return 0;
+    if (auto *def = db->getVar(var_usr).anyDef())
+      return def->type;
+    return 0;
+  }
+};
+
+Pos indexPos(WorkingFile *wf, Position p) {
+  int col = p.character;
+  std::optional<int> line = wf->getIndexPosFromBufferPos(p.line, &col, false);
+  return {(uint16_t)(line ? *line : p.line), (int16_t)col};
+}
+
+// The qualifier before the identifier ending at |end|, e.g. "std::chrono" for
+// "std::chrono::seconds".
+std::string_view qualifierBefore(std::string_view line, size_t begin) {
+  size_t i = begin;
+  while (i >= 2 && line.substr(i - 2, 2) == "::") {
+    size_t j = i - 2;
+    while (j > 0 && isAsciiIdentifierContinue(line[j - 1]))
+      j--;
+    if (j == i - 2)
+      break;
+    i = j;
+  }
+  return i < begin ? line.substr(i, begin - 2 - i) : std::string_view();
+}
 } // namespace
 
 void MessageHandler::textDocument_completion(CompletionParam &param, ReplyOnce &reply) {
@@ -416,6 +293,7 @@ void MessageHandler::textDocument_completion(CompletionParam &param, ReplyOnce &
     reply.notOpened(path);
     return;
   }
+  QueryFile *file = findFile(path);
 
   CompletionList result;
 
@@ -424,21 +302,16 @@ void MessageHandler::textDocument_completion(CompletionParam &param, ReplyOnce &
   std::string buffer_line;
   if (param.position.line >= 0 && param.position.line < wf->buffer_lines.size())
     buffer_line = wf->buffer_lines[param.position.line];
-
-  clang::CodeCompleteOptions ccOpts;
-  ccOpts.IncludeBriefComments = true;
-  ccOpts.IncludeCodePatterns = StringRef(buffer_line).ltrim().startswith("#");
-  ccOpts.IncludeFixIts = true;
-  ccOpts.IncludeMacros = true;
+  bool preprocessor = StringRef(buffer_line).ltrim().starts_with("#");
 
   if (param.context.triggerKind == CompletionTriggerKind::TriggerCharacter && param.context.triggerCharacter) {
     bool ok = true;
-    int col = param.position.character - 2;
+    int col = std::min<int>(param.position.character, buffer_line.size()) - 2;
     switch ((*param.context.triggerCharacter)[0]) {
     case '"':
     case '/':
     case '<':
-      ok = ccOpts.IncludeCodePatterns; // start with #
+      ok = false;
       break;
     case ':':
       ok = col >= 0 && buffer_line[col] == ':'; // ::
@@ -457,34 +330,121 @@ void MessageHandler::textDocument_completion(CompletionParam &param, ReplyOnce &
   Position end_pos = param.position;
   Position begin_pos = wf->getCompletionPosition(param.position, &filter);
 
-  SemaManager::OnComplete callback = [filter, path, begin_pos, end_pos, reply,
-                                      buffer_line](CodeCompleteConsumer *optConsumer) {
-    if (!optConsumer)
-      return;
-    auto *consumer = static_cast<CompletionConsumer *>(optConsumer);
-    CompletionList result;
-    result.items = consumer->ls_items;
-
+  if (cache.isCacheValid(path, buffer_line, begin_pos)) {
+    cache.withLock([&]() { result.items = cache.result; });
     filterCandidates(result, filter, begin_pos, end_pos, buffer_line);
     reply(result);
-    if (!consumer->from_cache) {
-      cache.withLock([&]() {
-        cache.path = path;
-        cache.line = buffer_line;
-        cache.position = begin_pos;
-        cache.result = consumer->ls_items;
-      });
-    }
-  };
-
-  if (cache.isCacheValid(path, buffer_line, begin_pos)) {
-    CompletionConsumer consumer(ccOpts, true);
-    cache.withLock([&]() { consumer.ls_items = cache.result; });
-    callback(&consumer);
-  } else {
-    manager->comp_tasks.pushBack(
-        std::make_unique<SemaManager::CompTask>(reply.id, param.textDocument.uri.getPath(), begin_pos,
-                                                std::make_unique<CompletionConsumer>(ccOpts, false), ccOpts, callback));
+    return;
   }
+
+  Collector c{db};
+  // Classify the context: "x.", "x->", "X::" or unqualified.
+  int col = std::min<int>(begin_pos.character, buffer_line.size());
+  while (col > 0 && isspace((unsigned char)buffer_line[col - 1]))
+    col--;
+  StringRef before(buffer_line.data(), std::min<size_t>(col, buffer_line.size()));
+  bool member = before.ends_with(".") || before.ends_with("->"), scope = before.ends_with("::");
+  if (file && (member || scope)) {
+    int base_end = col - (before.ends_with(".") ? 1 : 2);
+    while (base_end > 0 && isspace((unsigned char)buffer_line[base_end - 1]))
+      base_end--;
+    // Skip a call or subscript: f(x). or a[i].
+    int depth = 0;
+    for (; base_end > 0; base_end--) {
+      char ch = buffer_line[base_end - 1];
+      if (ch == ')' || ch == ']')
+        depth++;
+      else if (ch == '(' || ch == '[') {
+        if (--depth < 0)
+          break;
+      } else if (depth == 0)
+        break;
+    }
+    int base_begin = base_end;
+    while (base_begin > 0 && isAsciiIdentifierContinue(buffer_line[base_begin - 1]))
+      base_begin--;
+    std::string_view base_word(buffer_line.data() + base_begin, base_end - base_begin);
+    Pos ipos = indexPos(wf, param.position);
+    if (member && base_word == "this") {
+      if (Usr cls = findEnclosingFunction(db, file, ipos).second)
+        c.addMembers(cls, false, 0);
+    } else if (base_word.size()) {
+      std::vector<SymbolIdx> syms;
+      Position base_pos{param.position.line, base_end - 1};
+      for (SymbolRef sym : findSymbolsAtLocation(wf, file, base_pos))
+        syms.push_back(sym);
+      if (syms.empty())
+        syms = lookupName(db, file, ipos, base_word, qualifierBefore(buffer_line, base_begin));
+      for (SymbolIdx sym : syms) {
+        if (sym.kind == Kind::Var) {
+          if (Usr t = c.typeOfVar(sym.usr))
+            c.addMembers(t, scope, 0);
+        } else if (sym.kind == Kind::Type) {
+          c.addMembers(sym.usr, true, 0);
+        } else if (sym.kind == Kind::Func && db->hasFunc(sym.usr)) {
+          // Guess the return type from the declaration.
+          if (auto *def = db->getFunc(sym.usr).anyDef()) {
+            StringRef ret = StringRef(def->detailed_name, def->qual_name_offset).trim();
+            ret.consume_front("virtual ");
+            ret.consume_front("static ");
+            ret = ret.rtrim(" *&").trim();
+            ret.consume_front("const ");
+            for (QueryType &type : db->types)
+              if (auto *tdef = type.anyDef(); tdef && StringRef(tdef->name(true).data(), tdef->name(true).size()) == ret) {
+                c.addMembers(type.usr, false, 0);
+                break;
+              }
+          }
+        }
+        if (c.items.size())
+          break;
+      }
+    }
+  } else if (!preprocessor) {
+    if (file) {
+      auto [func, cls] = findEnclosingFunction(db, file, indexPos(wf, param.position));
+      if (func && db->hasFunc(func))
+        for (auto &def : db->getFunc(func).def)
+          for (Usr usr : def.vars)
+            c.addVar(usr, 0);
+      if (cls)
+        c.addMembers(cls, true, 1);
+    }
+    if (filter.size()) {
+      // Global symbols.
+      for (QueryFunc &func : db->funcs)
+        if (auto *def = func.anyDef(); def && def->parent_kind != SymbolKind::Class &&
+                                       def->parent_kind != SymbolKind::Struct)
+          if (def->name(false).size() && toupper(def->name(false)[0]) == toupper(filter[0]))
+            c.add(func.usr, Kind::Func, *def, 2);
+      for (QueryType &type : db->types)
+        if (auto *def = type.anyDef(); def && def->kind != SymbolKind::TypeParameter && def->name(false).size())
+          if (toupper(def->name(false)[0]) == toupper(filter[0]))
+            c.add(type.usr, Kind::Type, *def, 2);
+      for (QueryVar &var : db->vars)
+        if (auto *def = var.anyDef(); def && !def->is_local() && def->kind != SymbolKind::Field &&
+                                      def->kind != SymbolKind::Parameter && def->name(false).size())
+          if (toupper(def->name(false)[0]) == toupper(filter[0]))
+            c.add(var.usr, Kind::Var, *def, 2);
+      for (const char *kw : kKeywords) {
+        CompletionItem item;
+        item.label = item.filterText = item.textEdit.newText = kw;
+        item.kind = CompletionItemKind::Keyword;
+        item.priority_ = 3;
+        item.score_ = 0;
+        c.items.push_back(std::move(item));
+      }
+    }
+  }
+
+  result.items = c.items;
+  cache.withLock([&]() {
+    cache.path = path;
+    cache.line = buffer_line;
+    cache.position = begin_pos;
+    cache.result = c.items;
+  });
+  filterCandidates(result, filter, begin_pos, end_pos, buffer_line);
+  reply(result);
 }
 } // namespace ccls

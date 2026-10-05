@@ -1,0 +1,58 @@
+--- a/src/preproc.h
++++ b/src/preproc.h
+@@ -292,6 +292,15 @@
+ 			   values). */
+ #endif /* GNU_EXTENSIONS_ALLOWED */
+ 
++/*
++If non-NULL, called for each region of source text skipped by a false
++conditional directive.  start is the position of the end of the directive
++causing the skip and end is the position of the "#" of the directive ending it.
++*/
++typedef void a_skipped_range_callback(a_source_position *start,
++                                      a_source_position *end);
++extern EDG_THREAD a_skipped_range_callback *skipped_range_callback;
++
+ extern a_const_char *copy_header_name(a_boolean process_escapes);
+ 
+ /* Scan a preprocessing directive. */
+--- a/src/preproc.c
++++ b/src/preproc.c
+@@ -700,6 +700,9 @@
+ }  /* check_if_defined_macro */
+ 
+ 
++EDG_THREAD a_skipped_range_callback *skipped_range_callback = NULL;
++
++
+ static void skip_to_endif(a_boolean stop_skip_on_else_or_elif)
+ /*
+ Skip to the #endif corresponding to the current directive.  If
+@@ -711,6 +714,8 @@
+   a_boolean           condition;
+   a_boolean           save_currently_in_pp_if_skip = currently_in_pp_if_skip;
+   a_source_position   start_of_dir_position;
++  a_source_position   start_of_skip_position = pos_curr_token;
++  a_boolean           skip_end_found = FALSE;
+   a_pp_directive_kind directive;
+ 
+   db_enter(3, "skip_to_endif");
+@@ -742,6 +747,7 @@
+        token, and thus the first token on its line.  This is a preprocessing
+        directive. */
+     start_of_dir_position = pos_curr_token;
++    skip_end_found = TRUE;
+     in_preprocessing_directive = TRUE;
+     /* Identify the directive and process it. */
+     switch ((int)(directive = identify_dir_keyword())) {
+@@ -807,6 +813,10 @@
+     /* Keep looping, looking for directives. */
+   }  /* for */
+ end_skip:;
++  if (skipped_range_callback != NULL && !save_currently_in_pp_if_skip &&
++      skip_end_found) {
++    skipped_range_callback(&start_of_skip_position, &start_of_dir_position);
++  }  /* if */
+   currently_in_pp_if_skip = save_currently_in_pp_if_skip;
+   db_exit();
+ }  /* skip_to_endif */

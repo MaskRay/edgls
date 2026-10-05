@@ -803,4 +803,97 @@ std::vector<SymbolRef> findSymbolsAtLocation(WorkingFile *wfile, QueryFile *file
 
   return symbols;
 }
+
+std::pair<Usr, Usr> findEnclosingFunction(DB *db, QueryFile *file, Pos pos) {
+  Usr func = 0, cls = 0;
+  Range best_f, best_c;
+  for (auto &[sym, refcnt] : file->symbol2refcnt) {
+    if (refcnt <= 0 || !(sym.role & Role::Definition) || !sym.extent.contains(pos.line, pos.column))
+      continue;
+    if (sym.kind == Kind::Func && (!func || best_f.start < sym.extent.start)) {
+      func = sym.usr;
+      best_f = sym.extent;
+    } else if (sym.kind == Kind::Type && (!cls || best_c.start < sym.extent.start)) {
+      if (db->hasType(sym.usr))
+        if (auto *def = db->getType(sym.usr).anyDef())
+          if (def->kind == SymbolKind::Class || def->kind == SymbolKind::Struct) {
+            cls = sym.usr;
+            best_c = sym.extent;
+          }
+    }
+  }
+  if (func && !cls && db->hasFunc(func)) {
+    // An out-of-line member function definition: find the class by name.
+    if (auto *def = db->getFunc(func).anyDef()) {
+      std::string_view qualified = def->name(true), name = def->name(false);
+      if (qualified.size() > name.size() + 2) {
+        std::string_view qual = qualified.substr(0, qualified.size() - name.size() - 2);
+        for (QueryType &type : db->types)
+          if (auto *tdef = type.anyDef();
+              tdef && (tdef->kind == SymbolKind::Class || tdef->kind == SymbolKind::Struct) && tdef->name(true) == qual) {
+            cls = type.usr;
+            break;
+          }
+      }
+    }
+  }
+  return {func, cls};
+}
+
+std::vector<SymbolIdx> lookupName(DB *db, QueryFile *file, Pos pos, std::string_view name,
+                                  std::string_view qualifier) {
+  std::vector<SymbolIdx> ret;
+  auto addMembers = [&](const QueryType &type) {
+    for (auto &def : type.def) {
+      for (Usr usr : def.funcs)
+        if (db->hasFunc(usr))
+          if (auto *d = db->getFunc(usr).anyDef(); d && d->name(false) == name)
+            ret.push_back({usr, Kind::Func});
+      for (auto &[usr, _] : def.vars)
+        if (db->hasVar(usr))
+          if (auto *d = db->getVar(usr).anyDef(); d && d->name(false) == name)
+            ret.push_back({usr, Kind::Var});
+      for (Usr usr : def.types)
+        if (db->hasType(usr))
+          if (auto *d = db->getType(usr).anyDef(); d && d->name(false) == name)
+            ret.push_back({usr, Kind::Type});
+    }
+  };
+  if (qualifier.size()) {
+    for (QueryType &type : db->types)
+      if (auto *def = type.anyDef()) {
+        std::string_view q = def->name(true);
+        if (q == qualifier || (q.size() > qualifier.size() && q.substr(q.size() - qualifier.size()) == qualifier &&
+                               q[q.size() - qualifier.size() - 1] == ':'))
+          addMembers(type);
+      }
+    return ret;
+  }
+  if (file) {
+    auto [func, cls] = findEnclosingFunction(db, file, pos);
+    if (func && db->hasFunc(func))
+      for (auto &def : db->getFunc(func).def)
+        for (Usr usr : def.vars)
+          if (db->hasVar(usr))
+            if (auto *d = db->getVar(usr).anyDef(); d && d->name(false) == name)
+              ret.push_back({usr, Kind::Var});
+    if (ret.size())
+      return ret;
+    if (cls && db->hasType(cls))
+      addMembers(db->getType(cls));
+    if (ret.size())
+      return ret;
+  }
+  for (QueryVar &var : db->vars)
+    if (auto *def = var.anyDef(); def && !def->is_local() && def->kind != SymbolKind::Field &&
+                                  def->kind != SymbolKind::Parameter && def->name(false) == name)
+      ret.push_back({var.usr, Kind::Var});
+  for (QueryType &type : db->types)
+    if (auto *def = type.anyDef(); def && def->kind != SymbolKind::TypeParameter && def->name(false) == name)
+      ret.push_back({type.usr, Kind::Type});
+  for (QueryFunc &func : db->funcs)
+    if (auto *def = func.anyDef(); def && def->name(false) == name)
+      ret.push_back({func.usr, Kind::Func});
+  return ret;
+}
 } // namespace ccls

@@ -1,6 +1,7 @@
 // Copyright 2017-2018 ccls Authors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "edg/edg.hh"
 #include "log.hh"
 #include "pipeline.hh"
 #include "platform.hh"
@@ -8,7 +9,6 @@
 #include "test.hh"
 #include "working_files.hh"
 
-#include <clang/Basic/Version.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/CrashRecoveryContext.h>
@@ -35,7 +35,7 @@ std::vector<std::string> g_init_options;
 }
 
 namespace {
-OptionCategory C("ccls options");
+OptionCategory C("edgls options");
 
 #if LLVM_VERSION_MAJOR < 24 // llvmorg-24-init-10308-g50b8b5a101f2
 opt<bool> opt_help("h", desc("Alias for -help"), cat(C));
@@ -56,13 +56,12 @@ int main(int argc, char **argv) {
   traceMe();
   sys::PrintStackTraceOnErrorSignal(argv[0]);
   cl::SetVersionPrinter(
-      [](raw_ostream &os) { os << clang::getClangToolFullVersion("ccls version " CCLS_VERSION "\nclang") << "\n"; });
+      [](raw_ostream &os) { os << "edgls version " CCLS_VERSION "\nEDG C/C++ front end " << edg::version() << "\n"; });
 
   cl::HideUnrelatedOptions(C);
 
   ParseCommandLineOptions(argc, argv,
-                          "C/C++/Objective-C language server\n\n"
-                          "See more on https://github.com/MaskRay/ccls/wiki");
+                          "C/C++ language server based on the EDG front end\n");
 
 #if LLVM_VERSION_MAJOR < 24
   if (opt_help) {

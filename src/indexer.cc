@@ -3,1371 +3,744 @@
 
 #include "indexer.hh"
 
-#include "clang_tu.hh"
+#include "edg/edg.hh"
+#include "edg_args.hh"
 #include "log.hh"
 #include "pipeline.hh"
 #include "platform.hh"
 #include "sema_manager.hh"
 
-#include <clang/AST/AST.h>
-#include <clang/AST/ASTDiagnostic.h>
-#include <clang/AST/RecursiveASTVisitor.h>
-#include <clang/Basic/TargetInfo.h>
-#include <clang/Frontend/FrontendAction.h>
-#include <clang/Frontend/MultiplexConsumer.h>
-#include <clang/Index/IndexDataConsumer.h>
-#include <clang/Index/IndexingAction.h>
-#if LLVM_VERSION_MAJOR >= 23 // llvmorg-22-init-27296-g65cb738ff419
-#include <clang/UnifiedSymbolResolution/USRGeneration.h>
-#else
-#include <clang/Index/USRGeneration.h>
-#endif
-#include <clang/Lex/PreprocessorOptions.h>
-#include <llvm/ADT/DenseMap.h>
-#include <llvm/ADT/DenseSet.h>
+#include <llvm/ADT/StringRef.h>
 #include <llvm/Support/CrashRecoveryContext.h>
 #include <llvm/Support/Path.h>
 
 #include <algorithm>
+#include <deque>
 #include <inttypes.h>
-#include <map>
 #include <unordered_set>
 
-using namespace clang;
-
-#if LLVM_VERSION_MAJOR >= 18 // llvmorg-18-init-10631-gedd690b02e16
-#define TTK_Class TagTypeKind::Class
-#define TTK_Enum TagTypeKind::Enum
-#define TTK_Interface TagTypeKind::Interface
-#define TTK_Struct TagTypeKind::Struct
-#define TTK_Union TagTypeKind::Union
-#endif
+using namespace llvm;
 
 namespace ccls {
 namespace {
-
 GroupMatch *multiVersionMatcher;
 
-struct File {
-  std::string path;
-  int64_t mtime;
+bool isIdentChar(unsigned char c) { return isalnum(c) || c == '_' || c == '$' || c >= 0x80; }
+
+// Source text of a file with line offsets, for converting front end positions
+// (1-based line and column) to ccls positions (0-based). Columns count code
+// points.
+struct Text {
   std::string content;
-  std::unique_ptr<IndexFile> db;
-};
+  std::vector<uint32_t> lines;
 
-struct IndexParam {
-  std::unordered_map<FileID, File> uid2file;
-  std::unordered_map<FileID, bool> uid2multi;
-  struct DeclInfo {
-    Usr usr;
-    std::string short_name;
-    std::string qualified;
-  };
-  std::unordered_map<const Decl *, DeclInfo> decl2Info;
-
-  // A call to a forwarding function (e.g. std::make_unique<A>). The callee's
-  // body is instantiated at the end of the translation unit.
-  struct DeferredForward {
-    IndexFile *db;
-    Range loc;
-    Role role;
-    int lid;
-    const FunctionDecl *callee;
-    const Decl *caller; // nullptr if not in a function
-  };
-  std::vector<DeferredForward> deferred_forward;
-
-  // `auto x = dependent;` in a function template.
-  struct DeferredVar {
-    IndexFile *db;
-    const VarDecl *vd;
-    Usr usr;
-  };
-  std::vector<DeferredVar> deferred_var;
-
-  VFS &vfs;
-  ASTContext *ctx;
-  bool no_linkage;
-  IndexParam(VFS &vfs, bool no_linkage) : vfs(vfs), no_linkage(no_linkage) {}
-
-  void seenFile(FileID fid) {
-    // If this is the first time we have seen the file (ignoring if we are
-    // generating an index for it):
-    auto [it, inserted] = uid2file.try_emplace(fid);
-    if (inserted) {
-#if LLVM_VERSION_MAJOR < 19
-      const FileEntry *fe = ctx->getSourceManager().getFileEntryForID(fid);
-#else
-      OptionalFileEntryRef fe = ctx->getSourceManager().getFileEntryRefForID(fid);
-#endif
-      if (!fe)
-        return;
-      std::string path = pathFromFileEntry(*fe);
-      it->second.path = path;
-      it->second.mtime = fe->getModificationTime();
-      if (!it->second.mtime)
-        if (auto tim = lastWriteTime(path))
-          it->second.mtime = *tim;
-      if (std::optional<std::string> content = readContent(path))
-        it->second.content = *content;
-
-      if (!vfs.stamp(path, it->second.mtime, no_linkage ? 3 : 1))
-        return;
-      it->second.db = std::make_unique<IndexFile>(path, it->second.content, no_linkage);
-    }
+  void init(std::string c) {
+    content = std::move(c);
+    lines.assign(1, 0);
+    for (size_t i = 0; i < content.size(); i++)
+      if (content[i] == '\n')
+        lines.push_back(uint32_t(i + 1));
   }
-
-  IndexFile *consumeFile(FileID fid) {
-    seenFile(fid);
-    return uid2file[fid].db.get();
+  // Byte offset of a 1-based line and column (counted in code points), or
+  // npos.
+  size_t offset(int line, int column) const {
+    if (line < 1 || line > (int)lines.size())
+      return std::string::npos;
+    size_t off = lines[line - 1];
+    for (int col = 1; col < column && off < content.size() && content[off] != '\n'; col++)
+      do
+        off++;
+      while (off < content.size() && ((uint8_t)content[off] & 0xc0) == 0x80);
+    return off;
   }
-
-  bool useMultiVersion(FileID fid) {
-    auto it = uid2multi.try_emplace(fid);
-    if (it.second) {
-#if LLVM_VERSION_MAJOR < 19
-      if (const FileEntry *fe = ctx->getSourceManager().getFileEntryForID(fid))
-#else
-      if (OptionalFileEntryRef fe = ctx->getSourceManager().getFileEntryRefForID(fid))
-#endif
-        it.first->second = multiVersionMatcher->matches(pathFromFileEntry(*fe));
-    }
-    return it.first->second;
+  Pos pos(size_t off) const {
+    off = std::min(off, content.size());
+    int line = int(std::upper_bound(lines.begin(), lines.end(), uint32_t(off)) - lines.begin()) - 1;
+    int col = 0;
+    for (size_t i = lines[line]; i < off; i++)
+      if (((uint8_t)content[i] & 0xc0) != 0x80)
+        col++;
+    return {(uint16_t)std::min(line, (int)UINT16_MAX), (int16_t)std::min(col, (int)INT16_MAX)};
   }
 };
 
-StringRef getSourceInRange(const SourceManager &sm, const LangOptions &langOpts, SourceRange sr) {
-  SourceLocation bloc = sr.getBegin(), eLoc = sr.getEnd();
-  std::pair<FileID, unsigned> bInfo = sm.getDecomposedLoc(bloc), eInfo = sm.getDecomposedLoc(eLoc);
-  bool invalid = false;
-  StringRef buf = sm.getBufferData(bInfo.first, &invalid);
-  if (invalid)
-    return "";
-  return buf.substr(bInfo.second, eInfo.second + Lexer::MeasureTokenLength(eLoc, sm, langOpts) - bInfo.second);
-}
+const char *const kOperators[] = {
+    "<<=", ">>=", "<=>", "->*", "...", "::", "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||",
+    "+=",  "-=",  "*=",  "/=",  "%=",  "&=", "|=", "^=", ".*", "()", "[]", "+",  "-",  "*",  "/",  "%",  "^",
+    "&",   "|",   "~",   "!",   "=",   "<",  ">",  ",",  "(",  ")",  "[",  "]",  "{",  "}",  ";",  ":",  "."};
 
-Kind getKind(const Decl *d, SymbolKind &kind) {
-  switch (d->getKind()) {
-  case Decl::LinkageSpec:
-    return Kind::Invalid;
-  case Decl::Namespace:
-  case Decl::NamespaceAlias:
-    kind = SymbolKind::Namespace;
-    return Kind::Type;
-  case Decl::Concept:
-  case Decl::ObjCCategory:
-  case Decl::ObjCCategoryImpl:
-  case Decl::ObjCImplementation:
-  case Decl::ObjCInterface:
-  case Decl::ObjCProtocol:
-    kind = SymbolKind::Interface;
-    return Kind::Type;
-  case Decl::ObjCMethod:
-    kind = SymbolKind::Method;
-    return Kind::Func;
-  case Decl::ObjCProperty:
-    kind = SymbolKind::Property;
-    return Kind::Type;
-  case Decl::ClassTemplate:
-    kind = SymbolKind::Class;
-    return Kind::Type;
-  case Decl::FunctionTemplate:
-    kind = SymbolKind::Function;
-    return Kind::Func;
-  case Decl::TypeAliasTemplate:
-    kind = SymbolKind::TypeAlias;
-    return Kind::Type;
-  case Decl::VarTemplate:
-    kind = SymbolKind::Variable;
-    return Kind::Var;
-  case Decl::TemplateTemplateParm:
-    kind = SymbolKind::TypeParameter;
-    return Kind::Type;
-  case Decl::Enum:
-    kind = SymbolKind::Enum;
-    return Kind::Type;
-  case Decl::CXXRecord:
-  case Decl::Record:
-    kind = SymbolKind::Class;
-    // spec has no Union, use Class
-    if (auto *rd = dyn_cast<RecordDecl>(d))
-      if (rd->getTagKind() == TTK_Struct)
-        kind = SymbolKind::Struct;
-    return Kind::Type;
-  case Decl::ClassTemplateSpecialization:
-  case Decl::ClassTemplatePartialSpecialization:
-    kind = SymbolKind::Class;
-    return Kind::Type;
-  case Decl::TemplateTypeParm:
-    kind = SymbolKind::TypeParameter;
-    return Kind::Type;
-  case Decl::TypeAlias:
-  case Decl::Typedef:
-  case Decl::UnresolvedUsingTypename:
-    kind = SymbolKind::TypeAlias;
-    return Kind::Type;
-  case Decl::Using:
-    kind = SymbolKind::Null; // ignored
-    return Kind::Invalid;
-  case Decl::Binding:
-    kind = SymbolKind::Variable;
-    return Kind::Var;
-  case Decl::Field:
-  case Decl::ObjCIvar:
-    kind = SymbolKind::Field;
-    return Kind::Var;
-  case Decl::Function:
-    kind = SymbolKind::Function;
-    return Kind::Func;
-  case Decl::CXXMethod: {
-    const auto *md = cast<CXXMethodDecl>(d);
-    kind = md->isStatic() ? SymbolKind::StaticMethod : SymbolKind::Method;
-    return Kind::Func;
-  }
-  case Decl::CXXConstructor:
-    kind = SymbolKind::Constructor;
-    return Kind::Func;
-  case Decl::CXXConversion:
-  case Decl::CXXDestructor:
-    kind = SymbolKind::Method;
-    return Kind::Func;
-  case Decl::NonTypeTemplateParm:
-    // ccls extension
-    kind = SymbolKind::Parameter;
-    return Kind::Var;
-  case Decl::Var: {
-    auto vd = cast<VarDecl>(d);
-    if (vd->isStaticDataMember()) {
-      kind = SymbolKind::Field;
-      return Kind::Var;
+// The end offset of the token starting at |off|. Operator function names
+// ("operator+=", "operator new[]", "~Foo") are treated as one token.
+size_t tokenEnd(const std::string &s, size_t off) {
+  size_t n = s.size(), i = off;
+  if (i >= n)
+    return i;
+  if (s[i] == '~') {
+    size_t j = i + 1;
+    while (j < n && (s[j] == ' ' || s[j] == '\t'))
+      j++;
+    if (j < n && isIdentChar(s[j]) && !isdigit((unsigned char)s[j])) {
+      while (j < n && isIdentChar(s[j]))
+        j++;
+      return j;
     }
-    [[fallthrough]];
   }
-  case Decl::Decomposition:
-    kind = SymbolKind::Variable;
-    return Kind::Var;
-  case Decl::ImplicitParam:
-  case Decl::ParmVar:
-    // ccls extension
-    kind = SymbolKind::Parameter;
-    return Kind::Var;
-  case Decl::VarTemplateSpecialization:
-  case Decl::VarTemplatePartialSpecialization:
-    kind = SymbolKind::Variable;
-    return Kind::Var;
-  case Decl::EnumConstant:
-    kind = SymbolKind::EnumMember;
-    return Kind::Var;
-  case Decl::UnresolvedUsingValue:
-    kind = SymbolKind::Variable;
-    return Kind::Var;
-  case Decl::TranslationUnit:
-    return Kind::Invalid;
-
-  default:
-    return Kind::Invalid;
+  if (isIdentChar(s[i])) {
+    while (i < n && isIdentChar(s[i]))
+      i++;
+    if (s.compare(off, i - off, "operator") != 0)
+      return i;
+    size_t j = i;
+    while (j < n && (s[j] == ' ' || s[j] == '\t'))
+      j++;
+    if (j < n && isIdentChar(s[j])) {
+      // operator new, operator delete, or a conversion function.
+      size_t k = j;
+      while (k < n && isIdentChar(s[k]))
+        k++;
+      StringRef word(s.data() + j, k - j);
+      if (word == "new" || word == "delete") {
+        size_t l = k;
+        while (l < n && (s[l] == ' ' || s[l] == '\t'))
+          l++;
+        if (l + 1 < n && s[l] == '[' && s[l + 1] == ']')
+          return l + 2;
+      }
+      return k;
+    }
+    if (j + 1 < n && s[j] == '"' && s[j + 1] == '"') {
+      size_t k = j + 2;
+      while (k < n && (s[k] == ' ' || s[k] == '\t'))
+        k++;
+      while (k < n && isIdentChar(s[k]))
+        k++;
+      return k;
+    }
+    for (const char *op : kOperators)
+      if (s.compare(j, strlen(op), op) == 0)
+        return j + strlen(op);
+    return i;
   }
+  for (const char *op : kOperators)
+    if (s.compare(i, strlen(op), op) == 0)
+      return i + strlen(op);
+  return i + 1;
 }
 
-LanguageId getDeclLanguage(const Decl *d) {
-  switch (d->getKind()) {
-  default:
-    return LanguageId::C;
-  case Decl::ImplicitParam:
-  case Decl::ObjCAtDefsField:
-  case Decl::ObjCCategory:
-  case Decl::ObjCCategoryImpl:
-  case Decl::ObjCCompatibleAlias:
-  case Decl::ObjCImplementation:
-  case Decl::ObjCInterface:
-  case Decl::ObjCIvar:
-  case Decl::ObjCMethod:
-  case Decl::ObjCProperty:
-  case Decl::ObjCPropertyImpl:
-  case Decl::ObjCProtocol:
-  case Decl::ObjCTypeParam:
-    return LanguageId::ObjC;
-  case Decl::CXXConstructor:
-  case Decl::CXXConversion:
-  case Decl::CXXDestructor:
-  case Decl::CXXMethod:
-  case Decl::CXXRecord:
-  case Decl::ClassTemplate:
-  case Decl::ClassTemplatePartialSpecialization:
-  case Decl::ClassTemplateSpecialization:
-  case Decl::Friend:
-  case Decl::FriendTemplate:
-  case Decl::FunctionTemplate:
-  case Decl::LinkageSpec:
-  case Decl::Namespace:
-  case Decl::NamespaceAlias:
-  case Decl::NonTypeTemplateParm:
-  case Decl::StaticAssert:
-  case Decl::TemplateTemplateParm:
-  case Decl::TemplateTypeParm:
-  case Decl::UnresolvedUsingTypename:
-  case Decl::UnresolvedUsingValue:
-  case Decl::Using:
-  case Decl::UsingDirective:
-  case Decl::UsingShadow:
-    return LanguageId::Cpp;
+// Skip a comment, string literal, or character literal starting at |i|.
+// Returns |i| if there is none.
+size_t skipNonCode(const std::string &s, size_t i) {
+  size_t n = s.size();
+  if (s[i] == '/' && i + 1 < n && s[i + 1] == '/') {
+    while (i < n && s[i] != '\n')
+      i++;
+    return i;
   }
-}
-
-// clang/lib/AST/DeclPrinter.cpp
-QualType getBaseType(QualType t, bool deduce_auto) {
-  QualType baseType = t;
-  while (!baseType.isNull() && !baseType->isSpecifierType()) {
-    if (const PointerType *pTy = baseType->getAs<PointerType>())
-      baseType = pTy->getPointeeType();
-    else if (const BlockPointerType *bPy = baseType->getAs<BlockPointerType>())
-      baseType = bPy->getPointeeType();
-    else if (const ArrayType *aTy = dyn_cast<ArrayType>(baseType))
-      baseType = aTy->getElementType();
-    else if (const VectorType *vTy = baseType->getAs<VectorType>())
-      baseType = vTy->getElementType();
-    else if (const ReferenceType *rTy = baseType->getAs<ReferenceType>())
-      baseType = rTy->getPointeeType();
-    else if (const ParenType *pTy = baseType->getAs<ParenType>())
-      baseType = pTy->desugar();
-    else if (deduce_auto) {
-      if (const AutoType *aTy = baseType->getAs<AutoType>())
-        baseType = aTy->getDeducedType();
-      else
-        break;
-    } else
-      break;
+  if (s[i] == '/' && i + 1 < n && s[i + 1] == '*') {
+    size_t e = s.find("*/", i + 2);
+    return e == std::string::npos ? n : e + 2;
   }
-  return baseType;
-}
-
-const Decl *getTypeDecl(QualType t, bool *specialization = nullptr) {
-  Decl *d = nullptr;
-  t = getBaseType(t.getUnqualifiedType(), true);
-  const Type *tp = t.getTypePtrOrNull();
-  if (!tp)
-    return nullptr;
-
-try_again:
-  switch (tp->getTypeClass()) {
-  case Type::Typedef:
-    d = cast<TypedefType>(tp)->getDecl();
-    tp = cast<TypedefType>(tp)->getDecl()->getUnderlyingType().getTypePtrOrNull();
-    if (tp)
-      goto try_again;
-    break;
-  case Type::ObjCObject:
-    d = cast<ObjCObjectType>(tp)->getInterface();
-    break;
-  case Type::ObjCInterface:
-    d = cast<ObjCInterfaceType>(tp)->getDecl();
-    break;
-  case Type::Record:
-  case Type::Enum:
-    d = cast<TagType>(tp)->getDecl();
-    break;
-  case Type::TemplateTypeParm:
-    d = cast<TemplateTypeParmType>(tp)->getDecl();
-    break;
-  case Type::TemplateSpecialization:
-    if (specialization)
-      *specialization = true;
-    if (const RecordType *record = tp->getAs<RecordType>())
-      d = record->getDecl();
-    else
-      d = cast<TemplateSpecializationType>(tp)->getTemplateName().getAsTemplateDecl();
-    break;
-
-  case Type::Auto:
-  case Type::DeducedTemplateSpecialization:
-    tp = cast<DeducedType>(tp)->getDeducedType().getTypePtrOrNull();
-    if (tp)
-      goto try_again;
-    break;
-
-  case Type::SubstTemplateTypeParm:
-    tp = cast<SubstTemplateTypeParmType>(tp)->getReplacementType().getTypePtr();
-    goto try_again;
-
-  case Type::InjectedClassName:
-    d = cast<InjectedClassNameType>(tp)->getDecl();
-    break;
-
-    // FIXME: Template type parameters!
-
-#if LLVM_VERSION_MAJOR < 22 // llvmorg-22-init-3166-g91cdd35008e9
-  case Type::Elaborated:
-    tp = cast<ElaboratedType>(tp)->getNamedType().getTypePtrOrNull();
-    goto try_again;
-#endif
-
-  default:
-    break;
+  // A digit separator, e.g. 1'000: the quote is inside a pp-number, which
+  // starts with a digit (unlike the prefix of L'a' or u8'a').
+  if (s[i] == '\'' && i + 1 < n && isalnum((unsigned char)s[i + 1])) {
+    size_t j = i;
+    while (j > 0 && (isalnum((unsigned char)s[j - 1]) || s[j - 1] == '_' || s[j - 1] == '\'' || s[j - 1] == '.'))
+      j--;
+    if (j < i && isdigit((unsigned char)s[j]))
+      return i;
   }
-  return d;
+  if (s[i] == '"' || s[i] == '\'') {
+    // Raw string literal.
+    if (s[i] == '"' && i && s[i - 1] == 'R') {
+      size_t paren = s.find('(', i);
+      if (paren != std::string::npos) {
+        std::string delim = ")" + s.substr(i + 1, paren - i - 1) + "\"";
+        size_t e = s.find(delim, paren);
+        return e == std::string::npos ? n : e + delim.size();
+      }
+    }
+    char q = s[i++];
+    while (i < n && s[i] != q && s[i] != '\n') {
+      if (s[i] == '\\')
+        i++;
+      i++;
+    }
+    return std::min(i + 1, n);
+  }
+  return i;
 }
 
-// Whether d is a local variable or parameter of a template instantiation. Its
-// occurrences duplicate those of the variable in the template pattern, which
-// is indexed instead.
-bool isInstantiatedLocal(const Decl *d) {
-  if (!isa<VarDecl>(d) && !isa<BindingDecl>(d))
-    return false;
-  // Skip blocks and captured statements (e.g. OpenMP regions), but not lambdas.
-  for (const DeclContext *dc = d->getParentFunctionOrMethod(); dc; dc = dc->getParent())
-    if (auto *fd = dyn_cast<FunctionDecl>(dc))
-      return fd->isTemplateInstantiation();
-  return false;
-}
-
-// If vd is a local of a function template with exactly one instantiation,
-// return the corresponding variable in that instantiation, similar to clangd's
-// getOnlyInstantiation.
-const VarDecl *getOnlyInstantiatedVar(const VarDecl *vd) {
-  auto *fd = dyn_cast_or_null<FunctionDecl>(vd->getParentFunctionOrMethod());
-  const FunctionTemplateDecl *ftd = fd ? fd->getDescribedFunctionTemplate() : nullptr;
-  if (!ftd)
-    return nullptr;
-  const FunctionDecl *only = nullptr;
-  for (const FunctionDecl *spec : ftd->specializations()) {
-    if (spec->getTemplateSpecializationKind() == TSK_ExplicitSpecialization)
+// Find the end of a declaration whose name ends at |off|: the closing brace
+// of a body, or the last token before ';', ',' or an unbalanced ')'.
+// Returns the offset just past the last character.
+size_t declEnd(const std::string &s, size_t off, bool is_def, bool is_param) {
+  size_t n = s.size(), last = off;
+  int depth = 0;
+  // Within a mem-initializer list, '{' after an identifier starts an
+  // initializer rather than the function body.
+  bool mem_init = false;
+  char prev = 0;
+  for (size_t i = off; i < n;) {
+    size_t j = skipNonCode(s, i);
+    if (j != i) {
+      if (s[i] == '"' || s[i] == '\'')
+        last = j, prev = 'a';
+      i = j;
       continue;
-    if (only)
-      return nullptr;
-    only = spec;
-  }
-  if (!only)
-    return nullptr;
-  for (const Decl *d : only->decls())
-    if (auto *vd1 = dyn_cast<VarDecl>(d); vd1 && vd1->getLocation() == vd->getLocation())
-      return vd1;
-  return nullptr;
-}
-
-const Decl *getAdjustedDecl(const Decl *d) {
-  while (d) {
-    if (auto *r = dyn_cast<CXXRecordDecl>(d)) {
-      if (auto *s = dyn_cast<ClassTemplateSpecializationDecl>(r)) {
-        if (!s->isExplicitSpecialization()) {
-          llvm::PointerUnion<ClassTemplateDecl *, ClassTemplatePartialSpecializationDecl *> result =
-              s->getSpecializedTemplateOrPartial();
-#if LLVM_VERSION_MAJOR >= 15 // llvmorg-15-init-10510-gaab5bd180a42
-          if (auto *ctd = dyn_cast<ClassTemplateDecl *>(result))
-            d = ctd;
-          else
-            d = cast<ClassTemplatePartialSpecializationDecl *>(result);
-#else
-          if (result.is<ClassTemplateDecl *>())
-            d = result.get<ClassTemplateDecl *>();
-          else
-            d = result.get<ClassTemplatePartialSpecializationDecl *>();
-#endif
-          continue;
-        }
-      } else if (auto *d1 = r->getInstantiatedFromMemberClass()) {
-        d = d1;
+    }
+    char c = s[i];
+    if (isspace((unsigned char)c)) {
+      i++;
+      continue;
+    }
+    if (c == '#' && (i == 0 || s[i - 1] == '\n'))
+      break;
+    if (depth == 0) {
+      if (c == ';' || (c == ',' && (is_param || !mem_init)) || c == ')' || c == '}' || c == ']')
+        break;
+      if (c == ':' && i + 1 < n && s[i + 1] == ':') {
+        i += 2, last = i, prev = ':';
         continue;
       }
-    } else if (auto *ed = dyn_cast<EnumDecl>(d)) {
-      if (auto *d1 = ed->getInstantiatedFromMemberEnum()) {
-        d = d1;
-        continue;
+      if (c == ':' && !is_param)
+        mem_init = true;
+      if (c == '{' && is_def && !(mem_init && (isIdentChar(prev) || prev == '>'))) {
+        // The body.
+        int d = 0;
+        for (; i < n;) {
+          size_t k = skipNonCode(s, i);
+          if (k != i) {
+            i = k;
+            continue;
+          }
+          if (s[i] == '{')
+            d++;
+          else if (s[i] == '}' && --d == 0)
+            return i + 1;
+          i++;
+        }
+        return n;
       }
     }
-    break;
+    if (c == '(' || c == '[' || c == '{')
+      depth++;
+    else if (c == ')' || c == ']' || c == '}')
+      depth--;
+    i++;
+    last = i;
+    prev = c;
   }
-  return d;
+  return last;
 }
 
-// Whether fd is a specialization of a function template whose last parameter is
-// `Args &&...` of its own template parameter, e.g. std::make_unique.
-bool isLikelyForwardingFunction(const FunctionDecl *fd) {
-  const FunctionTemplateDecl *ft = fd->getPrimaryTemplate();
-  if (!ft || !ft->getTemplatedDecl()->getNumParams())
-    return false;
-  const FunctionDecl *pattern = ft->getTemplatedDecl();
-  const auto *pet = dyn_cast<PackExpansionType>(pattern->getParamDecl(pattern->getNumParams() - 1)->getType());
-  if (!pet)
-    return false;
-  const auto *ttpt = dyn_cast<TemplateTypeParmType>(pet->getPattern().getNonReferenceType().getTypePtr());
-  return ttpt && ft->getTemplateParameters()->getDepth() == ttpt->getDepth();
+// Find the start of the declaration containing the name at |off|.
+size_t declBegin(const std::string &s, size_t off, bool is_param) {
+  // Scan backward to the previous ';', '{', '}' or an access specifier,
+  // ignoring comments and preprocessor lines.
+  size_t i = off, begin = off;
+  int depth = 0;
+  while (i > 0) {
+    char c = s[i - 1];
+    // Ignore the rest of a line comment.
+    size_t ls = s.rfind('\n', i - 1);
+    ls = ls == std::string::npos ? 0 : ls + 1;
+    if (size_t cmt = ls + 1 < i ? StringRef(s.data() + ls, i - 1 - ls).find("//") : StringRef::npos;
+        cmt != StringRef::npos) {
+      i = ls + cmt;
+      continue;
+    }
+    if (c == '/' && i >= 2 && s[i - 2] == '*') {
+      size_t st = s.rfind("/*", i - 2);
+      if (st == std::string::npos)
+        break;
+      i = st;
+      continue;
+    }
+    if (s[ls] == '#' && ls < i - 1) {
+      // Preprocessor line.
+      break;
+    }
+    if (c == ')' || c == ']' || c == '>')
+      depth++;
+    else if (c == '(' || c == '[' || c == '<') {
+      if (depth == 0)
+        break;
+      depth--;
+    } else if (depth == 0 && (c == ';' || c == '{' || c == '}' || (is_param && c == ',')))
+      break;
+    else if (depth == 0 && c == ':' && !(i >= 2 && s[i - 2] == ':') && !(i < s.size() && s[i] == ':')) {
+      // public: / case x: / label:
+      break;
+    }
+    i--;
+    if (!isspace((unsigned char)c))
+      begin = i;
+  }
+  return begin;
 }
 
-struct ForwardingToConstructorVisitor : RecursiveASTVisitor<ForwardingToConstructorVisitor> {
-  llvm::DenseSet<const FunctionDecl *> &seen;
-  llvm::SmallVectorImpl<const CXXConstructorDecl *> &out;
+// The comment block immediately preceding offset |begin| (on the previous
+// lines) or a trailing ///< comment.
+std::string getComment(const std::string &s, size_t begin, size_t end) {
+  // Trailing comment on the same line.
+  size_t eol = s.find('\n', end);
+  if (eol == std::string::npos)
+    eol = s.size();
+  StringRef rest(s.data() + end, eol - end);
+  size_t tc = rest.find("///<");
+  if (tc == StringRef::npos)
+    tc = rest.find("//!<");
+  if (tc != StringRef::npos)
+    return rest.substr(tc + 4).trim().str();
 
-  ForwardingToConstructorVisitor(llvm::DenseSet<const FunctionDecl *> &seen,
-                                 llvm::SmallVectorImpl<const CXXConstructorDecl *> &out)
-      : seen(seen), out(out) {}
-
-  static constexpr unsigned kMaxDepth = 10;
-
-  bool VisitCallExpr(CallExpr *e) {
-    if (seen.size() >= kMaxDepth)
-      return true;
-    FunctionDecl *fd = e->getDirectCallee();
-    if (!fd || seen.contains(fd) || !isLikelyForwardingFunction(fd))
-      return true;
-    seen.insert(fd);
-    if (Stmt *body = fd->getBody())
-      TraverseStmt(body);
-    seen.erase(fd);
-    return true;
+  size_t ls = s.rfind('\n', begin ? begin - 1 : 0);
+  if (ls == std::string::npos || begin == 0)
+    return "";
+  std::vector<std::string> lines;
+  size_t line_end = ls;
+  bool block = false;
+  while (line_end != std::string::npos && line_end > 0) {
+    size_t line_start = s.rfind('\n', line_end - 1);
+    line_start = line_start == std::string::npos ? 0 : line_start + 1;
+    StringRef line = StringRef(s.data() + line_start, line_end - line_start).trim();
+    if (block) {
+      lines.push_back(line.str());
+      if (line.starts_with("/*"))
+        break;
+    } else if (line.starts_with("//")) {
+      lines.push_back(line.str());
+    } else if (line.ends_with("*/")) {
+      lines.push_back(line.str());
+      if (line.starts_with("/*"))
+        break;
+      block = true;
+    } else {
+      break;
+    }
+    if (line_start == 0)
+      break;
+    line_end = line_start - 1;
   }
-
-  bool VisitCXXNewExpr(CXXNewExpr *e) {
-    if (const auto *ce = e->getConstructExpr())
-      if (auto *cd = ce->getConstructor())
-        out.push_back(cd);
-    return true;
+  std::reverse(lines.begin(), lines.end());
+  std::string ret;
+  for (std::string &line : lines) {
+    StringRef l = line;
+    if (l.starts_with("//")) {
+      l = l.drop_while([](char c) { return c == '/' || c == '!' || c == '<'; });
+    } else {
+      if (l.starts_with("/*"))
+        l = l.drop_front(2).drop_while([](char c) { return c == '*' || c == '!' || c == '<'; });
+      if (l.ends_with("*/"))
+        l = l.drop_back(2).rtrim('*');
+      if (l.starts_with("*"))
+        l = l.drop_front(1);
+    }
+    if (l.starts_with(" "))
+      l = l.drop_front(1);
+    if (ret.size())
+      ret += '\n';
+    ret += l.rtrim().str();
   }
-};
-
-llvm::SmallVector<const CXXConstructorDecl *, 1> searchConstructorsInForwardingFunction(const FunctionDecl *fd) {
-  llvm::SmallVector<const CXXConstructorDecl *, 1> ret;
-  llvm::DenseSet<const FunctionDecl *> seen{fd};
-  if (Stmt *body = fd->getBody())
-    ForwardingToConstructorVisitor(seen, ret).TraverseStmt(body);
+  while (ret.size() && isspace((unsigned char)ret.back()))
+    ret.pop_back();
+  while (ret.size() && isspace((unsigned char)ret[0]))
+    ret.erase(0, 1);
   return ret;
 }
 
-bool validateRecord(const RecordDecl *rd) {
-  for (const auto *i : rd->fields()) {
-    QualType fqt = i->getType();
-    if (fqt->isIncompleteType() || fqt->isDependentType())
-      return false;
-    if (const RecordType *childType = i->getType()->getAs<RecordType>())
-      if (const RecordDecl *child = childType->getDecl())
-        if (!validateRecord(child))
-          return false;
+struct File {
+  std::string path;
+  int64_t mtime = 0;
+  Text text;
+  std::unique_ptr<IndexFile> db;
+};
+
+struct EntityInfo {
+  Usr usr = 0;
+  bool hashed = false;
+};
+
+struct IndexParam {
+  VFS &vfs;
+  bool no_linkage;
+  edg::Unit &unit;
+  const std::vector<std::pair<std::string, std::string>> &remapped;
+  std::deque<File> files;
+  // The front end has a file id for each inclusion of a file.
+  std::vector<File *> fid2file;
+  std::unordered_map<std::string, File *> path2file;
+  std::vector<EntityInfo> entities;
+
+  IndexParam(VFS &vfs, bool no_linkage, edg::Unit &unit,
+             const std::vector<std::pair<std::string, std::string>> &remapped)
+      : vfs(vfs), no_linkage(no_linkage), unit(unit), remapped(remapped) {}
+
+  File &file(int fid) {
+    if ((size_t)fid >= fid2file.size())
+      fid2file.resize(fid + 1);
+    if (File *f = fid2file[fid])
+      return *f;
+    std::string path = unit.files[fid].path;
+    std::string real = realPath(path);
+    if (real.size())
+      path = real;
+    normalizeFolder(path);
+    auto [it, inserted] = path2file.try_emplace(path);
+    if (inserted) {
+      File &f = files.emplace_back();
+      it->second = &f;
+      f.path = path;
+      if (auto t = lastWriteTime(path))
+        f.mtime = *t;
+      const std::string *buffer = nullptr;
+      for (auto &[name, content] : remapped)
+        if (name == path || name == unit.files[fid].path || realPath(name) == path)
+          buffer = &content;
+      if (buffer)
+        f.text.init(*buffer);
+      else if (std::optional<std::string> content = readContent(path))
+        f.text.init(std::move(*content));
+      else
+        f.text.init("");
+      if (vfs.stamp(path, f.mtime, no_linkage ? 3 : 1))
+        f.db = std::make_unique<IndexFile>(path, f.text.content, no_linkage);
+    }
+    return *(fid2file[fid] = it->second);
   }
-  return true;
+
+  IndexFile *consumeFile(int fid) { return fid >= 0 ? file(fid).db.get() : nullptr; }
+
+  Usr usr(int e) {
+    if ((size_t)e >= entities.size())
+      entities.resize(unit.entities.size());
+    EntityInfo &info = entities[e];
+    if (!info.hashed) {
+      info.hashed = true;
+      info.usr = hashUsr(unit.entities[e].usr);
+    }
+    return info.usr;
+  }
+};
+
+Kind toKind(edg::EntityKind k) { return Kind(uint8_t(k)); }
+
+template <typename Def> void setName(Def &def, const edg::Entity &e) {
+  def.detailed_name = intern(e.detailed_name);
+  def.qual_name_offset = e.qual_name_offset;
+  def.short_name_offset = e.short_name_offset;
+  def.short_name_size = e.short_name_size;
 }
 
-class IndexDataConsumer : public index::IndexDataConsumer {
-public:
-  ASTContext *ctx;
+class Indexer {
   IndexParam &param;
-
-  std::string getComment(const Decl *d) {
-    SourceManager &sm = ctx->getSourceManager();
-    const RawComment *rc = ctx->getRawCommentForAnyRedecl(d);
-    if (!rc)
-      return "";
-    StringRef raw = rc->getRawText(ctx->getSourceManager());
-    SourceRange sr = rc->getSourceRange();
-    std::pair<FileID, unsigned> bInfo = sm.getDecomposedLoc(sr.getBegin());
-    unsigned start_column = sm.getLineNumber(bInfo.first, bInfo.second);
-    std::string ret;
-    int pad = -1;
-    for (const char *p = raw.data(), *e = raw.end(); p < e;) {
-      // The first line starts with a comment marker, but the rest needs
-      // un-indenting.
-      unsigned skip = start_column - 1;
-      for (; skip > 0 && p < e && (*p == ' ' || *p == '\t'); p++)
-        skip--;
-      const char *q = p;
-      while (q < e && *q != '\n')
-        q++;
-      if (q < e)
-        q++;
-      // A minimalist approach to skip Doxygen comment markers.
-      // See https://www.stack.nl/~dimitri/doxygen/manual/docblocks.html
-      if (pad < 0) {
-        // First line, detect the length of comment marker and put into |pad|
-        const char *begin = p;
-        while (p < e && (*p == '/' || *p == '*' || *p == '-' || *p == '='))
-          p++;
-        if (p < e && (*p == '<' || *p == '!'))
-          p++;
-        if (p < e && *p == ' ')
-          p++;
-        if (p + 1 == q)
-          p++;
-        else
-          pad = int(p - begin);
-      } else {
-        // Other lines, skip |pad| bytes
-        int prefix = pad;
-        while (prefix > 0 && p < e && (*p == ' ' || *p == '/' || *p == '*' || *p == '<' || *p == '!'))
-          prefix--, p++;
-      }
-      ret.insert(ret.end(), p, q);
-      p = q;
-    }
-    while (ret.size() && isspace(ret.back()))
-      ret.pop_back();
-    if (StringRef(ret).endswith("*/") || StringRef(ret).endswith("\n/"))
-      ret.resize(ret.size() - 2);
-    while (ret.size() && isspace(ret.back()))
-      ret.pop_back();
-    return ret;
-  }
-
-  Usr getUsr(const Decl *d, IndexParam::DeclInfo **info = nullptr) const {
-    d = d->getCanonicalDecl();
-    auto [it, inserted] = param.decl2Info.try_emplace(d);
-    if (inserted) {
-      SmallString<256> usr;
-      index::generateUSRForDecl(d, usr);
-      auto &info = it->second;
-      info.usr = hashUsr(usr);
-      if (auto *nd = dyn_cast<NamedDecl>(d)) {
-        info.short_name = nd->getNameAsString();
-        llvm::raw_string_ostream os(info.qualified);
-        nd->printQualifiedName(os, getDefaultPolicy());
-        simplifyAnonymous(info.qualified);
-      }
-    }
-    if (info)
-      *info = &it->second;
-    return it->second.usr;
-  }
-
-  PrintingPolicy getDefaultPolicy() const {
-    PrintingPolicy pp(ctx->getLangOpts());
-#if LLVM_VERSION_MAJOR >= 23 // llvmorg-22-init-25026-gf5f8435605ba
-    pp.AnonymousTagNameStyle = static_cast<unsigned>(PrintingPolicy::AnonymousTagMode::Plain);
-#else
-    pp.AnonymousTagLocations = false;
-#endif
-    pp.TerseOutput = true;
-    pp.PolishForDeclaration = true;
-    pp.ConstantsAsWritten = true;
-    pp.SuppressTagKeyword = true;
-    pp.SuppressUnwrittenScope = g_config->index.name.suppressUnwrittenScope;
-    pp.SuppressInitializers = true;
-    pp.FullyQualifiedName = false;
-    return pp;
-  }
-
-  static void simplifyAnonymous(std::string &name) {
-    for (std::string::size_type i = 0;;) {
-      if ((i = name.find("(anonymous ", i)) == std::string::npos)
-        break;
-      i++;
-      if (name.size() - i > 19 && name.compare(i + 10, 9, "namespace") == 0)
-        name.replace(i, 19, "anon ns");
-      else
-        name.replace(i, 9, "anon");
-    }
-  }
-
-  template <typename Def>
-  void setName(const Decl *d, std::string_view short_name, std::string_view qualified, Def &def) {
-    SmallString<256> str;
-    llvm::raw_svector_ostream os(str);
-    d->print(os, getDefaultPolicy());
-
-    std::string name(str.data(), str.size());
-    simplifyAnonymous(name);
-    // Remove \n in DeclPrinter.cpp "{\n" + if(!TerseOutput)something + "}"
-    for (std::string::size_type i = 0;;) {
-      if ((i = name.find("{\n}", i)) == std::string::npos)
-        break;
-      name.replace(i, 3, "{}");
-    }
-    auto i = name.find(short_name);
-    if (short_name.size())
-      while (i != std::string::npos &&
-             ((i && isAsciiIdentifierContinue(name[i - 1])) || isAsciiIdentifierContinue(name[i + short_name.size()])))
-        i = name.find(short_name, i + short_name.size());
-    if (i == std::string::npos) {
-      // e.g. operator type-parameter-1
-      i = 0;
-      def.short_name_offset = 0;
-      def.short_name_size = name.size();
-    } else {
-      if (short_name.empty() || (i >= 2 && name[i - 2] == ':')) {
-        // Don't replace name with qualified name in ns::name Cls::*name
-        def.short_name_offset = i;
-      } else {
-        name.replace(i, short_name.size(), qualified);
-        def.short_name_offset = i + qualified.size() - short_name.size();
-      }
-      // name may be empty while short_name is not.
-      def.short_name_size = name.empty() ? 0 : short_name.size();
-    }
-    for (int paren = 0; i; i--) {
-      // Skip parentheses in "(anon struct)::name"
-      if (name[i - 1] == ')')
-        paren++;
-      else if (name[i - 1] == '(')
-        paren--;
-      else if (!(paren > 0 || isAsciiIdentifierContinue(name[i - 1]) || name[i - 1] == ':'))
-        break;
-    }
-    def.qual_name_offset = i;
-    def.detailed_name = intern(name);
-  }
-
-  void setVarName(const Decl *d, std::string_view short_name, std::string_view qualified, IndexVar::Def &def,
-                  QualType deduced_type = QualType()) {
-    QualType t;
-    const Expr *init = nullptr;
-    bool deduced = false;
-    if (auto *vd = dyn_cast<VarDecl>(d)) {
-      t = deduced_type.isNull() ? vd->getType() : deduced_type;
-      init = vd->getAnyInitializer();
-      def.storage = vd->getStorageClass();
-    } else if (auto *fd = dyn_cast<FieldDecl>(d)) {
-      t = fd->getType();
-      init = fd->getInClassInitializer();
-    } else if (auto *bd = dyn_cast<BindingDecl>(d)) {
-      t = bd->getType();
-      deduced = true;
-    }
-    if (!t.isNull()) {
-      if (t->getContainedDeducedType()) {
-        deduced = true;
-      } else if (auto *dt = dyn_cast<DecltypeType>(t)) {
-        // decltype(y) x;
-        while (dt && !dt->getUnderlyingType().isNull()) {
-          t = dt->getUnderlyingType();
-          dt = dyn_cast<DecltypeType>(t);
-        }
-        deduced = true;
-      }
-    }
-    std::string aka;
-    if (!t.isNull() && deduced) {
-      SmallString<256> str;
-      llvm::raw_svector_ostream os(str);
-      PrintingPolicy pp = getDefaultPolicy();
-      t.print(os, pp);
-#if LLVM_VERSION_MAJOR >= 14 // llvmorg-14-init-11692-gec64d10340da
-      // Like clangd, show the desugared type if it differs, e.g. for iterator.
-      bool should_aka = false;
-      QualType desugared = desugarForDiagnostic(*ctx, t, should_aka);
-      if (should_aka) {
-        PrintingPolicy pp1 = pp;
-        pp1.FullyQualifiedName = true;
-        if ((aka = desugared.getAsString(pp1)) == str)
-          aka.clear();
-      }
-#endif
-      if (str.size() && (str.back() != ' ' && str.back() != '*' && str.back() != '&'))
-        str += ' ';
-      def.qual_name_offset = str.size();
-      def.short_name_offset = str.size() + qualified.size() - short_name.size();
-      def.short_name_size = short_name.size();
-      str += StringRef(qualified.data(), qualified.size());
-      def.detailed_name = intern(str);
-    } else {
-      setName(d, short_name, qualified, def);
-    }
-    std::string hover;
-    if (init) {
-      SourceManager &sm = ctx->getSourceManager();
-      const LangOptions &lang = ctx->getLangOpts();
-      SourceRange sr = sm.getExpansionRange(init->getSourceRange()).getAsRange();
-      SourceLocation l = d->getLocation();
-      if (!l.isMacroID() && sm.isBeforeInTranslationUnit(l, sr.getBegin())) {
-        StringRef buf = getSourceInRange(sm, lang, sr);
-        Twine init = buf.count('\n') <= g_config->index.maxInitializerLines - 1
-                         ? buf.size() && buf[0] == ':' ? Twine(" ", buf) : Twine(" = ", buf)
-                         : Twine();
-        hover = (def.detailed_name + init).str();
-      }
-    }
-    if (hover.empty() && aka.size())
-      hover = def.detailed_name;
-    if (hover.size()) {
-      if (def.storage == SC_Static && strncmp(def.detailed_name, "static ", 7))
-        hover.insert(0, "static ");
-      if (aka.size())
-        hover += "\n// aka " + aka;
-      def.hover = intern(hover);
-    }
-  }
-
-  static int getFileLID(IndexFile *db, SourceManager &sm, FileID fid) {
-    auto [it, inserted] = db->uid2lid_and_path.try_emplace(fid);
-    if (inserted) {
-#if LLVM_VERSION_MAJOR < 19
-      const FileEntry *fe = sm.getFileEntryForID(fid);
-#else
-      OptionalFileEntryRef fe = sm.getFileEntryRefForID(fid);
-#endif
-      if (!fe) {
-        it->second.first = -1;
-        return -1;
-      }
-      it->second.first = db->uid2lid_and_path.size() - 1;
-      it->second.second = pathFromFileEntry(*fe);
-    }
-    return it->second.first;
-  }
-
-  void addMacroUse(IndexFile *db, SourceManager &sm, Usr usr, Kind kind, SourceLocation sl) const {
-    FileID fid = sm.getFileID(sl);
-    int lid = getFileLID(db, sm, fid);
-    if (lid < 0)
-      return;
-    Range spell = fromTokenRange(sm, ctx->getLangOpts(), SourceRange(sl, sl));
-    Use use{{spell, Role::Dynamic}, lid};
-    switch (kind) {
-    case Kind::Func:
-      db->toFunc(usr).uses.push_back(use);
-      break;
-    case Kind::Type:
-      db->toType(usr).uses.push_back(use);
-      break;
-    case Kind::Var:
-      db->toVar(usr).uses.push_back(use);
-      break;
-    default:
-      llvm_unreachable("");
-    }
-  }
-
-  void collectRecordMembers(IndexType &type, const RecordDecl *rd) {
-    SmallVector<std::pair<const RecordDecl *, int>, 2> stack{{rd, 0}};
-    llvm::DenseSet<const RecordDecl *> seen;
-    seen.insert(rd);
-    while (stack.size()) {
-      int offset;
-      std::tie(rd, offset) = stack.back();
-      stack.pop_back();
-      if (!rd->isCompleteDefinition() || rd->isDependentType() || rd->isInvalidDecl() || !validateRecord(rd))
-        offset = -1;
-      for (FieldDecl *fd : rd->fields()) {
-        int offset1 = offset < 0 ? -1 : int(offset + ctx->getFieldOffset(fd));
-        if (fd->getIdentifier())
-          type.def.vars.emplace_back(getUsr(fd), offset1);
-        else if (const auto *rt1 = fd->getType()->getAs<RecordType>()) {
-          if (const RecordDecl *rd1 = rt1->getDecl())
-            if (seen.insert(rd1).second)
-              stack.push_back({rd1, offset1});
-        }
-      }
-    }
-  }
+  edg::Unit &unit;
 
 public:
-  IndexDataConsumer(IndexParam &param) : param(param) {}
-  void initialize(ASTContext &ctx) override { this->ctx = param.ctx = &ctx; }
-  bool handleDeclOccurrence(const Decl *d, index::SymbolRoleSet roles, ArrayRef<index::SymbolRelation> relations,
-                            SourceLocation src_loc, ASTNodeInfo ast_node) override {
-    if (!param.no_linkage) {
-      if (auto *nd = dyn_cast<NamedDecl>(d); nd && nd->hasLinkage())
-        ;
-      else
-        return true;
-    }
-    SourceManager &sm = ctx->getSourceManager();
-    const LangOptions &lang = ctx->getLangOpts();
-    FileID fid;
-    SourceLocation spell = sm.getSpellingLoc(src_loc);
-    Range loc;
-    auto r = sm.isMacroArgExpansion(src_loc) ? CharSourceRange::getTokenRange(spell) : sm.getExpansionRange(src_loc);
-    loc = fromCharSourceRange(sm, lang, r);
-    fid = sm.getFileID(r.getBegin());
-    if (fid.isInvalid())
-      return true;
-    int lid = -1;
-    IndexFile *db;
-    if (g_config->index.multiVersion && param.useMultiVersion(fid)) {
-      db = param.consumeFile(sm.getMainFileID());
-      if (!db)
-        return true;
-      param.seenFile(fid);
-      if (!sm.isWrittenInMainFile(r.getBegin()))
-        lid = getFileLID(db, sm, fid);
-    } else {
-      db = param.consumeFile(fid);
-      if (!db)
-        return true;
-    }
+  Indexer(IndexParam &param) : param(param), unit(param.unit) {}
 
-    // spell, extent, comments use OrigD while most others use adjusted |D|.
-    const Decl *origD = ast_node.OrigD;
-    const DeclContext *sem_dc = origD->getDeclContext()->getRedeclContext();
-    const DeclContext *lex_dc = ast_node.ContainerDC->getRedeclContext();
-    {
-      const NamespaceDecl *nd;
-      while ((nd = dyn_cast<NamespaceDecl>(cast<Decl>(sem_dc))) && nd->isAnonymousNamespace())
-        sem_dc = nd->getDeclContext()->getRedeclContext();
-      while ((nd = dyn_cast<NamespaceDecl>(cast<Decl>(lex_dc))) && nd->isAnonymousNamespace())
-        lex_dc = nd->getDeclContext()->getRedeclContext();
+  Range tokenRange(File &f, const edg::Loc &loc, size_t *off_begin = nullptr, size_t *off_end = nullptr) {
+    size_t b = f.text.offset(loc.line, loc.column);
+    if (b == std::string::npos)
+      return {};
+    size_t e = tokenEnd(f.text.content, b);
+    if (off_begin)
+      *off_begin = b;
+    if (off_end)
+      *off_end = e;
+    return {f.text.pos(b), f.text.pos(e)};
+  }
+
+  void addOccurrence(const edg::Occurrence &o) {
+    IndexFile *db = param.consumeFile(o.loc.file);
+    if (!db)
+      return;
+    File &f = param.file(o.loc.file);
+    const edg::Entity &e = unit.entities[o.entity];
+    if (!param.no_linkage && e.is_local)
+      return;
+    Usr usr = param.usr(o.entity);
+    Kind kind = toKind(e.kind);
+    bool implicit = o.role & edg::RoleImplicit;
+    if (kind == Kind::Func && implicit && (e.short_name == "operator new" || e.short_name == "operator delete" ||
+                                           e.short_name == "operator new[]" || e.short_name == "operator delete[]"))
+      return;
+    size_t ob, oe;
+    Range range = tokenRange(f, o.loc, &ob, &oe);
+    if (!range.valid())
+      return;
+    const std::string &text = f.text.content;
+    // An implicit constructor call is reported at the initializer, e.g. the
+    // "(" in "new Foo()". Attribute it to the type name.
+    if (kind == Kind::Func && implicit && e.symbol_kind == (uint8_t)SymbolKind::Constructor &&
+        (text[ob] == '(' || text[ob] == '{')) {
+      size_t i = ob;
+      while (i > 0 && isspace((unsigned char)text[i - 1]))
+        i--;
+      size_t j = i;
+      while (j > 0 && isIdentChar(text[j - 1]))
+        j--;
+      if (j < i) {
+        ob = j, oe = i;
+        range = {f.text.pos(ob), f.text.pos(oe)};
+      }
     }
-    Role role = static_cast<Role>(roles);
-    db->language = LanguageId((int)db->language | (int)getDeclLanguage(d));
+    Role role = Role(o.role);
+    bool is_def = o.role & edg::RoleDefinition, is_decl = o.role & edg::RoleDeclaration;
+    // A namespace has many definitions; index them as declarations.
+    if (is_def && e.symbol_kind == (uint8_t)SymbolKind::Namespace) {
+      is_def = false, is_decl = true;
+      role = Role((o.role & ~edg::RoleDefinition) | edg::RoleDeclaration);
+    }
+    if (kind == Kind::Func && !is_def && !is_decl && !(o.role & edg::RoleAddress))
+      role = role | Role::Call;
 
-    bool is_decl = roles & uint32_t(index::SymbolRole::Declaration);
-    bool is_def = roles & uint32_t(index::SymbolRole::Definition);
-    if (is_decl && d->getKind() == Decl::Binding)
-      is_def = true;
-    IndexFunc *func = nullptr;
-    IndexType *type = nullptr;
-    IndexVar *var = nullptr;
-    SymbolKind ls_kind = SymbolKind::Unknown;
-    Kind kind = getKind(d, ls_kind);
-
-    if (is_def)
-      switch (d->getKind()) {
-      case Decl::CXXConversion: // *operator* int => *operator int*
-      case Decl::CXXDestructor: // *~*A => *~A*
-      case Decl::CXXMethod:     // *operator*= => *operator=*
-      case Decl::Function:      // operator delete
-        if (src_loc.isFileID()) {
-          SourceRange sr = cast<FunctionDecl>(origD)->getNameInfo().getSourceRange();
-          if (sr.getEnd().isFileID())
-            loc = fromTokenRange(sm, lang, sr);
+    auto extentOf = [&]() -> Range {
+      if (o.extent_begin.valid()) {
+        size_t b = f.text.offset(o.extent_begin.line, o.extent_begin.column),
+               en = f.text.offset(o.extent_end.line, o.extent_end.column);
+        if (b != std::string::npos && en != std::string::npos && b <= en) {
+          en = tokenEnd(text, en);
+          // The front end may not know the body of a definition (e.g. a
+          // template's).
+          if (is_def && (kind == Kind::Func || kind == Kind::Type) && en >= oe) {
+            size_t i = en;
+            for (;;) {
+              while (i < text.size() && isspace((unsigned char)text[i]))
+                i++;
+              size_t j = i < text.size() ? skipNonCode(text, i) : i;
+              if (j == i || text[i] == '"' || text[i] == '\'')
+                break;
+              i = j;
+            }
+            if (i < text.size() && (text[i] == '{' || (text[i] == ':' && text.compare(i, 2, "::"))))
+              en = std::max(en, declEnd(text, i, true, false));
+            else if (i < text.size() && text[i] == '=' &&
+                     (kind == Kind::Func || e.symbol_kind == (uint8_t)SymbolKind::TypeAlias))
+              en = std::max(en, declEnd(text, i, false, false));
+          }
+          return {f.text.pos(b), f.text.pos(en)};
         }
-        break;
-      default:
-        break;
       }
-    else {
-      // e.g. typedef Foo<int> gg; => Foo has an unadjusted `D`
-      const Decl *d1 = getAdjustedDecl(d);
-      if (d1 && d1 != d)
-        d = d1;
-    }
-    if (isInstantiatedLocal(d))
-      return true;
-
-    IndexParam::DeclInfo *info;
-    Usr usr = getUsr(d, &info);
-
-    auto do_def_decl = [&](auto *entity) {
-      Use use{{loc, role}, lid};
-      if (is_def) {
-        SourceRange sr = origD->getSourceRange();
-        entity->def.spell = {use, fromTokenRangeDefaulted(sm, lang, sr, fid, loc)};
-        entity->def.parent_kind = SymbolKind::File;
-        getKind(cast<Decl>(sem_dc), entity->def.parent_kind);
-      } else if (is_decl) {
-        SourceRange sr = origD->getSourceRange();
-        entity->declarations.push_back({use, fromTokenRangeDefaulted(sm, lang, sr, fid, loc)});
-      } else {
-        entity->uses.push_back(use);
-        return;
+      if (e.symbol_kind == (uint8_t)SymbolKind::Macro) {
+        size_t eol = f.text.content.find('\n', oe);
+        while (eol != std::string::npos && eol > 0 && f.text.content[eol - 1] == '\\')
+          eol = f.text.content.find('\n', eol + 1);
+        size_t start = f.text.content.rfind('#', ob);
+        if (start == std::string::npos)
+          start = ob;
+        return {f.text.pos(start), f.text.pos(eol == std::string::npos ? f.text.content.size() : eol)};
       }
-      if (entity->def.comments[0] == '\0' && g_config->index.comments)
-        entity->def.comments = intern(getComment(origD));
+      bool is_param = e.symbol_kind == (uint8_t)SymbolKind::Parameter;
+      size_t b = declBegin(f.text.content, ob, is_param);
+      size_t en = declEnd(f.text.content, oe, is_def && kind != Kind::Var, is_param);
+      if (kind == Kind::Var && is_def && !is_param) {
+        // Include a braced initializer.
+        en = declEnd(f.text.content, oe, false, false);
+      }
+      return {f.text.pos(b), f.text.pos(std::max(en, oe))};
     };
-    switch (kind) {
-    case Kind::Invalid:
-      if (ls_kind == SymbolKind::Unknown)
-        LOG_S(INFO) << "Unhandled " << int(d->getKind()) << " " << info->qualified << " in " << db->path << ":"
-                    << (loc.start.line + 1) << ":" << (loc.start.column + 1);
-      return true;
-    case Kind::File:
-      return true;
-    case Kind::Func:
-      func = &db->toFunc(usr);
-      func->def.kind = ls_kind;
-      // Mark as Role::Implicit to span one more column to the left/right.
-      if (!is_def && !is_decl && (d->getKind() == Decl::CXXConstructor || d->getKind() == Decl::CXXConversion))
-        role = Role(role | Role::Implicit);
-      do_def_decl(func);
-      if (spell != src_loc)
-        addMacroUse(db, sm, usr, Kind::Func, spell);
-      if (func->def.detailed_name[0] == '\0')
-        setName(d, info->short_name, info->qualified, func->def);
-      if (is_def || is_decl) {
-        const Decl *dc = cast<Decl>(sem_dc);
-        if (getKind(dc, ls_kind) == Kind::Type)
-          db->toType(getUsr(dc)).def.funcs.push_back(usr);
+    auto commentOf = [&](const Range &extent) -> const char * {
+      if (!g_config->index.comments)
+        return "";
+      size_t b = f.text.offset(extent.start.line + 1, 1);
+      if (b == std::string::npos)
+        return "";
+      while (b < f.text.content.size() && (f.text.content[b] == ' ' || f.text.content[b] == '\t'))
+        b++;
+      return intern(getComment(f.text.content, b, oe));
+    };
+
+    auto doDefDecl = [&](auto &entity) {
+      Use use{{range, role}, -1};
+      if (is_def) {
+        Range extent = extentOf();
+        entity.def.spell = {use, extent};
+        entity.def.parent_kind = SymbolKind(e.parent_kind);
+        if (!entity.def.comments[0])
+          entity.def.comments = commentOf(extent);
+      } else if (is_decl) {
+        Range extent = extentOf();
+        entity.declarations.push_back({use, extent});
+        if (!entity.def.comments[0])
+          entity.def.comments = commentOf(extent);
       } else {
-        const Decl *dc = cast<Decl>(lex_dc);
-        bool dc_is_func = getKind(dc, ls_kind) == Kind::Func;
-        if (dc_is_func)
-          db->toFunc(getUsr(dc)).def.callees.push_back({loc, usr, Kind::Func, role});
-        if (const auto *fd = dyn_cast<FunctionDecl>(origD);
-            fd && fd->isTemplateInstantiation() && isLikelyForwardingFunction(fd))
-          param.deferred_forward.push_back({db, loc, Role(role | Role::Implicit), lid, fd, dc_is_func ? dc : nullptr});
+        entity.uses.push_back(use);
       }
-      break;
-    case Kind::Type:
-      type = &db->toType(usr);
-      type->def.kind = ls_kind;
-      do_def_decl(type);
-      if (spell != src_loc)
-        addMacroUse(db, sm, usr, Kind::Type, spell);
-      if ((is_def || type->def.detailed_name[0] == '\0') && info->short_name.size()) {
-        if (d->getKind() == Decl::TemplateTypeParm)
-          type->def.detailed_name = intern(info->short_name);
-        else
-          // OrigD may be detailed, e.g. "struct D : B {}"
-          setName(origD, info->short_name, info->qualified, type->def);
-      }
+    };
+    // The initializer as written, e.g. " = 1" or "{1}".
+    auto initializer = [&]() -> std::string {
+      if (!o.init_begin.valid())
+        return "";
+      size_t b = f.text.offset(o.init_begin.line, o.init_begin.column),
+             en = f.text.offset(o.init_end.line, o.init_end.column);
+      if (b == std::string::npos || en == std::string::npos || b > en)
+        return "";
+      StringRef init(f.text.content.data() + b, tokenEnd(f.text.content, en) - b);
+      if (init.count('\n') > g_config->index.maxInitializerLines - 1)
+        return "";
+      if (init.consume_front("="))
+        return (" = " + init.ltrim()).str();
+      return init.str();
+    };
+
+    if (kind == Kind::Func && (is_def || is_decl) && e.parent >= 0 &&
+        (e.symbol_kind == (uint8_t)SymbolKind::Constructor || e.short_name[0] == '~')) {
+      size_t b = ob + (text[ob] == '~');
+      while (b < oe && !isIdentChar(text[b]))
+        b++;
+      if (b < oe)
+        db->toType(param.usr(e.parent)).uses.push_back({{{f.text.pos(b), f.text.pos(oe)}, Role::Reference}, -1});
+    }
+
+    switch (kind) {
+    case Kind::Func: {
+      IndexFunc &func = db->toFunc(usr);
+      func.def.kind = SymbolKind(e.symbol_kind);
+      func.def.storage = uint8_t(e.storage);
+      doDefDecl(func);
+      if (func.def.detailed_name[0] == '\0')
+        setName(func.def, e);
       if (is_def || is_decl) {
-        const Decl *dc = cast<Decl>(sem_dc);
-        if (getKind(dc, ls_kind) == Kind::Type)
-          db->toType(getUsr(dc)).def.types.push_back(usr);
-      }
-      break;
-    case Kind::Var:
-      var = &db->toVar(usr);
-      var->def.kind = ls_kind;
-      do_def_decl(var);
-      if (spell != src_loc)
-        addMacroUse(db, sm, usr, Kind::Var, spell);
-      if (var->def.detailed_name[0] == '\0')
-        setVarName(d, info->short_name, info->qualified, var->def);
-      if (is_def || is_decl) {
-        const Decl *dc = cast<Decl>(sem_dc);
-        Kind kind = getKind(dc, var->def.parent_kind);
-        if (kind == Kind::Func)
-          db->toFunc(getUsr(dc)).def.vars.push_back(usr);
-        else if (kind == Kind::Type && !isa<RecordDecl>(sem_dc))
-          db->toType(getUsr(dc)).def.vars.emplace_back(usr, -1);
-        if (auto *vd = dyn_cast<ValueDecl>(d))
-          setVarType(db, *var, usr, d, vd->getType());
-        if (auto *vd = dyn_cast<VarDecl>(d);
-            vd && is_def && vd->getType()->isDependentType() && vd->getType()->getContainedDeducedType())
-          param.deferred_var.push_back({db, vd, usr});
-      } else if (!var->def.spell && var->declarations.empty()) {
-        // e.g. lambda parameter
-        SourceLocation l = d->getLocation();
-        if (sm.getFileID(l) == fid) {
-          var->def.spell = {Use{{fromTokenRange(sm, lang, {l, l}), Role::Definition}, lid},
-                            fromTokenRange(sm, lang, d->getSourceRange())};
-          var->def.parent_kind = SymbolKind::Method;
+        if (e.parent >= 0 && unit.entities[e.parent].kind == edg::EntityKind::Type)
+          db->toType(param.usr(e.parent)).def.funcs.push_back(usr);
+        for (int b : e.bases) {
+          Usr usr1 = param.usr(b);
+          func.def.bases.push_back(usr1);
+          db->toFunc(usr1).derived.push_back(usr);
         }
+      } else if (o.container >= 0) {
+        db->toFunc(param.usr(o.container)).def.callees.push_back({range, usr, Kind::Func, role});
       }
       break;
     }
-
-    switch (d->getKind()) {
-    case Decl::Namespace:
-      if (d->isFirstDecl()) {
-        auto *nd = cast<NamespaceDecl>(d);
-        auto *nd1 = cast<Decl>(nd->getParent());
-        if (isa<NamespaceDecl>(nd1)) {
-          Usr usr1 = getUsr(nd1);
-          type->def.bases.push_back(usr1);
+    case Kind::Type: {
+      IndexType &type = db->toType(usr);
+      type.def.kind = SymbolKind(e.symbol_kind);
+      doDefDecl(type);
+      if (type.def.detailed_name[0] == '\0' || is_def)
+        setName(type.def, e);
+      if (is_def || is_decl) {
+        if (e.parent >= 0 && unit.entities[e.parent].kind == edg::EntityKind::Type)
+          db->toType(param.usr(e.parent)).def.types.push_back(usr);
+      }
+      if (is_def || (is_decl && e.symbol_kind == (uint8_t)SymbolKind::Namespace)) {
+        for (int b : e.bases) {
+          Usr usr1 = param.usr(b);
+          type.def.bases.push_back(usr1);
           db->toType(usr1).derived.push_back(usr);
         }
+        if (type.def.vars.empty())
+          for (auto &[field, offset] : e.fields)
+            if (field >= 0)
+              type.def.vars.emplace_back(param.usr(field), offset);
       }
-      break;
-    case Decl::NamespaceAlias: {
-      auto *nad = cast<NamespaceAliasDecl>(d);
-      if (const NamespaceDecl *nd = nad->getNamespace()) {
-        Usr usr1 = getUsr(nd);
-        type->def.alias_of = usr1;
-        (void)db->toType(usr1);
+      if (e.alias_of >= 0 && (is_def || is_decl)) {
+        type.def.alias_of = param.usr(e.alias_of);
+        (void)db->toType(type.def.alias_of);
       }
       break;
     }
-    case Decl::CXXRecord:
-      if (is_def) {
-        auto *rd = dyn_cast<CXXRecordDecl>(d);
-        if (rd && rd->hasDefinition())
-          for (const CXXBaseSpecifier &base : rd->bases())
-            if (const Decl *baseD = getAdjustedDecl(getTypeDecl(base.getType()))) {
-              Usr usr1 = getUsr(baseD);
-              type->def.bases.push_back(usr1);
-              db->toType(usr1).derived.push_back(usr);
-            }
-      }
-      [[fallthrough]];
-    case Decl::Enum:
-    case Decl::Record:
-      if (auto *tag_d = dyn_cast<TagDecl>(d)) {
-        if (type->def.detailed_name[0] == '\0' && info->short_name.empty()) {
-          StringRef tag;
-          switch (tag_d->getTagKind()) {
-          case TTK_Struct:
-            tag = "struct";
-            break;
-          case TTK_Interface:
-            tag = "__interface";
-            break;
-          case TTK_Union:
-            tag = "union";
-            break;
-          case TTK_Class:
-            tag = "class";
-            break;
-          case TTK_Enum:
-            tag = "enum";
-            break;
-          }
-          if (TypedefNameDecl *td = tag_d->getTypedefNameForAnonDecl()) {
-            StringRef name = td->getName();
-            std::string detailed = ("anon " + tag + " " + name).str();
-            type->def.detailed_name = intern(detailed);
-            type->def.short_name_size = detailed.size();
-          } else {
-            std::string name = ("anon " + tag).str();
-            type->def.detailed_name = intern(name);
-            type->def.short_name_size = name.size();
-          }
-        }
-        if (is_def && !isa<EnumDecl>(d))
-          if (auto *ord = dyn_cast<RecordDecl>(origD))
-            collectRecordMembers(*type, ord);
-      }
-      break;
-    case Decl::ClassTemplateSpecialization:
-    case Decl::ClassTemplatePartialSpecialization:
-      type->def.kind = SymbolKind::Class;
-      if (is_def) {
-        if (auto *ord = dyn_cast<RecordDecl>(origD))
-          collectRecordMembers(*type, ord);
-        if (auto *rd = dyn_cast<CXXRecordDecl>(d)) {
-          Decl *d1 = nullptr;
-          if (auto *sd = dyn_cast<ClassTemplatePartialSpecializationDecl>(rd))
-            d1 = sd->getSpecializedTemplate();
-          else if (auto *sd = dyn_cast<ClassTemplateSpecializationDecl>(rd)) {
-            llvm::PointerUnion<ClassTemplateDecl *, ClassTemplatePartialSpecializationDecl *> result =
-                sd->getSpecializedTemplateOrPartial();
-#if LLVM_VERSION_MAJOR >= 15 // llvmorg-15-init-10510-gaab5bd180a42
-            if (auto *ctd = dyn_cast<ClassTemplateDecl *>(result))
-              d1 = ctd;
-            else
-              d1 = cast<ClassTemplatePartialSpecializationDecl *>(result);
-#else
-            if (result.is<ClassTemplateDecl *>())
-              d1 = result.get<ClassTemplateDecl *>();
-            else
-              d1 = result.get<ClassTemplatePartialSpecializationDecl *>();
-#endif
-
-          } else
-            d1 = rd->getInstantiatedFromMemberClass();
-          if (d1) {
-            Usr usr1 = getUsr(d1);
-            type->def.bases.push_back(usr1);
-            db->toType(usr1).derived.push_back(usr);
-          }
-        }
-      }
-      break;
-    case Decl::TypeAlias:
-    case Decl::Typedef:
-    case Decl::UnresolvedUsingTypename:
-      if (auto *td = dyn_cast<TypedefNameDecl>(d)) {
-        bool specialization = false;
-        QualType t = td->getUnderlyingType();
-        if (const Decl *d1 = getAdjustedDecl(getTypeDecl(t, &specialization))) {
-          Usr usr1 = getUsr(d1);
-          IndexType &type1 = db->toType(usr1);
-          type->def.alias_of = usr1;
-          // Not visited template<class T> struct B {typedef A<T> t;};
-          if (specialization) {
-            const TypeSourceInfo *tsi = td->getTypeSourceInfo();
-            SourceLocation l1 = tsi->getTypeLoc().getBeginLoc();
-            if (sm.getFileID(l1) == fid)
-              type1.uses.push_back({{fromTokenRange(sm, lang, {l1, l1}), Role::Reference}, lid});
-          }
-        }
-      }
-      break;
-    case Decl::CXXMethod:
+    case Kind::Var: {
+      IndexVar &var = db->toVar(usr);
+      var.def.kind = SymbolKind(e.symbol_kind);
+      var.def.storage = uint8_t(e.storage);
+      doDefDecl(var);
+      if (var.def.detailed_name[0] == '\0')
+        setName(var.def, e);
       if (is_def || is_decl) {
-        if (auto *nd = dyn_cast<NamedDecl>(d)) {
-          SmallVector<const NamedDecl *, 8> overDecls;
-          ctx->getOverriddenMethods(nd, overDecls);
-          for (const auto *nd1 : overDecls) {
-            Usr usr1 = getUsr(nd1);
-            func->def.bases.push_back(usr1);
-            db->toFunc(usr1).derived.push_back(usr);
+        if (e.parent >= 0) {
+          const edg::Entity &p = unit.entities[e.parent];
+          if (p.kind == edg::EntityKind::Func)
+            db->toFunc(param.usr(e.parent)).def.vars.push_back(usr);
+          else if (p.kind == edg::EntityKind::Type && p.symbol_kind != (uint8_t)SymbolKind::Class &&
+                   p.symbol_kind != (uint8_t)SymbolKind::Struct)
+            db->toType(param.usr(e.parent)).def.vars.emplace_back(usr, -1);
+        }
+        if (e.type >= 0) {
+          var.def.type = param.usr(e.type);
+          if (e.symbol_kind != (uint8_t)SymbolKind::EnumMember)
+            db->toType(var.def.type).instances.push_back(usr);
+        }
+        if (is_def && e.symbol_kind != (uint8_t)SymbolKind::Macro && !var.def.hover[0]) {
+          std::string init = initializer();
+          if (init.size()) {
+            std::string hover = var.def.detailed_name;
+            if (var.def.storage == SC_Static && strncmp(var.def.detailed_name, "static ", 7))
+              hover = "static " + hover;
+            var.def.hover = intern(hover + init);
           }
         }
       }
-      break;
-    case Decl::EnumConstant:
-      if (is_def && strchr(var->def.detailed_name, '=') == nullptr) {
-        auto *ecd = cast<EnumConstantDecl>(d);
-        const auto &val = ecd->getInitVal();
-        std::string init =
-            " = " + (val.isSigned() ? std::to_string(val.getSExtValue()) : std::to_string(val.getZExtValue()));
-        var->def.hover = intern(var->def.detailed_name + init);
+      if (e.symbol_kind == (uint8_t)SymbolKind::Macro && is_def) {
+        const Range &ext = var.def.spell->extent;
+        size_t b = f.text.offset(ext.start.line + 1, 1);
+        size_t en = f.text.offset(ext.end.line + 1, 1);
+        if (b != std::string::npos && en != std::string::npos) {
+          size_t eol = f.text.content.find('\n', en);
+          if (eol == std::string::npos)
+            eol = f.text.content.size();
+          StringRef text(f.text.content.data() + b, eol - b);
+          text = text.trim();
+          var.def.hover = intern(text.count('\n') <= g_config->index.maxInitializerLines - 1
+                                     ? text.str()
+                                     : ("#define " + e.short_name));
+        }
       }
       break;
+    }
     default:
       break;
     }
-    return true;
   }
 
-  void setVarType(IndexFile *db, IndexVar &var, Usr usr, const Decl *d, QualType t) {
-    if (t.isNull())
-      return;
-    Usr usr1;
-    if (auto *bt = t->getAs<BuiltinType>())
-      usr1 = static_cast<Usr>(bt->getKind());
-    else if (const Decl *d1 = getAdjustedDecl(getTypeDecl(t)))
-      usr1 = getUsr(d1);
-    else
-      return;
-    var.def.type = usr1;
-    if (!isa<EnumConstantDecl>(d))
-      db->toType(usr1).instances.push_back(usr);
-  }
-
-  void finish() override {
-    for (const auto &dv : param.deferred_var) {
-      const VarDecl *vd1 = getOnlyInstantiatedVar(dv.vd);
-      if (!vd1)
+  void addSkippedRanges() {
+    for (const edg::SkippedRange &r : unit.skipped) {
+      IndexFile *db = param.consumeFile(r.begin.file);
+      if (!db)
         continue;
-      IndexParam::DeclInfo *info;
-      getUsr(dv.vd, &info);
-      IndexVar &var = dv.db->toVar(dv.usr);
-      var.def.detailed_name = var.def.hover = "";
-      setVarName(dv.vd, info->short_name, info->qualified, var.def, vd1->getType());
-      setVarType(dv.db, var, dv.usr, dv.vd, vd1->getType());
-    }
-    llvm::DenseMap<const FunctionDecl *, llvm::SmallVector<const CXXConstructorDecl *, 1>> ctors;
-    for (const auto &df : param.deferred_forward) {
-      auto [it, inserted] = ctors.try_emplace(df.callee);
-      if (inserted)
-        it->second = searchConstructorsInForwardingFunction(df.callee);
-      for (const CXXConstructorDecl *cd : it->second) {
-        Usr cusr = getUsr(cd);
-        df.db->toFunc(cusr).uses.push_back({{df.loc, df.role}, df.lid});
-        if (df.caller)
-          df.db->toFunc(getUsr(df.caller)).def.callees.push_back({df.loc, cusr, Kind::Func, df.role});
+      File &f = param.file(r.begin.file);
+      size_t b = f.text.offset(r.begin.line, 1), e = f.text.offset(r.end.line, r.end.column);
+      if (b == std::string::npos || e == std::string::npos || b > e)
+        continue;
+      // Include the directive ending the region, e.g. "#endif".
+      const std::string &text = f.text.content;
+      if (e < text.size() && text[e] == '#') {
+        e++;
+        while (e < text.size() && (text[e] == ' ' || text[e] == '\t'))
+          e++;
+        while (e < text.size() && isIdentChar(text[e]))
+          e++;
       }
-    }
-  }
-};
-
-class IndexPPCallbacks : public PPCallbacks {
-  SourceManager &sm;
-  IndexParam &param;
-
-  std::pair<StringRef, Usr> getMacro(const Token &tok) const {
-    StringRef name = tok.getIdentifierInfo()->getName();
-    SmallString<256> usr("@macro@");
-    usr += name;
-    return {name, hashUsr(usr)};
-  }
-
-public:
-  IndexPPCallbacks(SourceManager &sm, IndexParam &param) : sm(sm), param(param) {}
-  void FileChanged(SourceLocation sl, FileChangeReason reason, SrcMgr::CharacteristicKind, FileID) override {
-    if (reason == FileChangeReason::EnterFile)
-      (void)param.consumeFile(sm.getFileID(sl));
-  }
-  void InclusionDirective(SourceLocation hashLoc, const Token &tok, StringRef included, bool isAngled,
-                          CharSourceRange filenameRange,
-#if LLVM_VERSION_MAJOR >= 16 // llvmorg-16-init-15080-g854c10f8d185
-                          OptionalFileEntryRef fileRef,
-#elif LLVM_VERSION_MAJOR >= 15 // llvmorg-15-init-7692-gd79ad2f1dbc2
-                          llvm::Optional<FileEntryRef> fileRef,
-#else
-                          const FileEntry *file,
-#endif
-                          StringRef searchPath, StringRef relativePath, const clang::Module *suggestedModule,
-#if LLVM_VERSION_MAJOR >= 19 // llvmorg-19-init-1720-gda95d926f6fc
-                          bool moduleImported,
-#endif
-                          SrcMgr::CharacteristicKind fileType) override {
-#if LLVM_VERSION_MAJOR >= 15 // llvmorg-15-init-7692-gd79ad2f1dbc2
-    const FileEntry *file = fileRef ? &fileRef->getFileEntry() : nullptr;
-#endif
-    if (!file)
-      return;
-    auto spell = fromCharSourceRange(sm, param.ctx->getLangOpts(), filenameRange, nullptr);
-    FileID fid = sm.getFileID(filenameRange.getBegin());
-    if (IndexFile *db = param.consumeFile(fid)) {
-#if LLVM_VERSION_MAJOR < 19
-      std::string path = pathFromFileEntry(*file);
-#else
-      std::string path = pathFromFileEntry(*fileRef);
-#endif
-      if (path.size())
-        db->includes.push_back({spell.start.line, intern(path)});
-    }
-  }
-  void MacroDefined(const Token &tok, const MacroDirective *md) override {
-    const LangOptions &lang = param.ctx->getLangOpts();
-    SourceLocation sl = md->getLocation();
-    FileID fid = sm.getFileID(sl);
-    if (IndexFile *db = param.consumeFile(fid)) {
-      auto [name, usr] = getMacro(tok);
-      IndexVar &var = db->toVar(usr);
-      Range range = fromTokenRange(sm, lang, {sl, sl}, nullptr);
-      var.def.kind = SymbolKind::Macro;
-      var.def.parent_kind = SymbolKind::File;
-      if (var.def.spell)
-        var.declarations.push_back(*var.def.spell);
-      const MacroInfo *mi = md->getMacroInfo();
-      SourceRange sr(mi->getDefinitionLoc(), mi->getDefinitionEndLoc());
-      Range extent = fromTokenRange(sm, param.ctx->getLangOpts(), sr);
-      var.def.spell = {Use{{range, Role::Definition}}, extent};
-      if (var.def.detailed_name[0] == '\0') {
-        var.def.detailed_name = intern(name);
-        var.def.short_name_size = name.size();
-        StringRef buf = getSourceInRange(sm, lang, sr);
-        var.def.hover = intern(buf.count('\n') <= g_config->index.maxInitializerLines - 1
-                                   ? Twine("#define ", getSourceInRange(sm, lang, sr)).str()
-                                   : Twine("#define ", name).str());
-      }
-    }
-  }
-  void MacroExpands(const Token &tok, const MacroDefinition &, SourceRange sr, const MacroArgs *) override {
-    SourceLocation sl = sm.getSpellingLoc(sr.getBegin());
-    FileID fid = sm.getFileID(sl);
-    if (IndexFile *db = param.consumeFile(fid)) {
-      IndexVar &var = db->toVar(getMacro(tok).second);
-      var.uses.push_back({{fromTokenRange(sm, param.ctx->getLangOpts(), {sl, sl}, nullptr), Role::Dynamic}});
-    }
-  }
-  void MacroUndefined(const Token &tok, const MacroDefinition &md, const MacroDirective *ud) override {
-    if (ud) {
-      SourceLocation sl = ud->getLocation();
-      MacroExpands(tok, md, {sl, sl}, nullptr);
-    }
-  }
-  void SourceRangeSkipped(SourceRange sr, SourceLocation) override {
-    Range range = fromCharSourceRange(sm, param.ctx->getLangOpts(), CharSourceRange::getCharRange(sr));
-    FileID fid = sm.getFileID(sr.getBegin());
-    if (fid.isValid())
-      if (IndexFile *db = param.consumeFile(fid))
+      Range range{f.text.pos(b), f.text.pos(e)};
+      // A file included more than once is reported once per inclusion.
+      if (std::find(db->skipped_ranges.begin(), db->skipped_ranges.end(), range) == db->skipped_ranges.end())
         db->skipped_ranges.push_back(range);
+    }
+  }
+
+  void addIncludes() {
+    for (const edg::Include &inc : unit.includes) {
+      IndexFile *db = param.consumeFile(inc.file);
+      if (!db || inc.line <= 0)
+        continue;
+      File &child = param.file(inc.included_file);
+      const char *path = intern(child.path);
+      if (child.path.size() && std::none_of(db->includes.begin(), db->includes.end(), [&](const IndexInclude &i) {
+            return i.line == inc.line - 1 && i.resolved_path == path;
+          }))
+        db->includes.push_back({inc.line - 1, path});
+    }
   }
 };
 
-class IndexFrontendAction : public ASTFrontendAction {
-  std::shared_ptr<IndexDataConsumer> dataConsumer;
-  const index::IndexingOptions &indexOpts;
-  IndexParam &param;
-
-public:
-  IndexFrontendAction(std::shared_ptr<IndexDataConsumer> dataConsumer, const index::IndexingOptions &indexOpts,
-                      IndexParam &param)
-      : dataConsumer(std::move(dataConsumer)), indexOpts(indexOpts), param(param) {}
-  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &ci, StringRef inFile) override {
-    class SkipProcessed : public ASTConsumer {
-      IndexParam &param;
-      const ASTContext *ctx = nullptr;
-
-    public:
-      SkipProcessed(IndexParam &param) : param(param) {}
-      void Initialize(ASTContext &ctx) override { this->ctx = &ctx; }
-      bool shouldSkipFunctionBody(Decl *d) override {
-        const SourceManager &sm = ctx->getSourceManager();
-        FileID fid = sm.getFileID(sm.getExpansionLoc(d->getLocation()));
-        return !(g_config->index.multiVersion && param.useMultiVersion(fid)) && !param.consumeFile(fid);
-      }
-    };
-
-    std::shared_ptr<Preprocessor> pp = ci.getPreprocessorPtr();
-    pp->addPPCallbacks(std::make_unique<IndexPPCallbacks>(pp->getSourceManager(), param));
-    std::vector<std::unique_ptr<ASTConsumer>> consumers;
-    consumers.push_back(std::make_unique<SkipProcessed>(param));
-    consumers.push_back(index::createIndexingASTConsumer(dataConsumer, indexOpts, std::move(pp)));
-    return std::make_unique<MultiplexConsumer>(std::move(consumers));
-  }
-};
-
-class IndexDiags : public DiagnosticConsumer {
-public:
-  llvm::SmallString<64> message;
-  void HandleDiagnostic(DiagnosticsEngine::Level level, const clang::Diagnostic &info) override {
-    DiagnosticConsumer::HandleDiagnostic(level, info);
-    if (message.empty())
-      info.FormatDiagnostic(message);
-  }
-};
+template <typename T> void uniquify(std::vector<T> &a) {
+  std::unordered_set<T> seen;
+  size_t n = 0;
+  for (size_t i = 0; i < a.size(); i++)
+    if (seen.insert(a[i]).second)
+      a[n++] = a[i];
+  a.resize(n);
+}
 } // namespace
 
 const int IndexFile::kMajorVersion = 21;
@@ -1399,162 +772,131 @@ IndexVar &IndexFile::toVar(Usr usr) {
 
 std::string IndexFile::toString() { return ccls::serialize(SerializeFormat::Json, *this); }
 
-template <typename T> void uniquify(std::vector<T> &a) {
-  std::unordered_set<T> seen;
-  size_t n = 0;
-  for (size_t i = 0; i < a.size(); i++)
-    if (seen.insert(a[i]).second)
-      a[n++] = a[i];
-  a.resize(n);
-}
-
 namespace idx {
 void init() {
   multiVersionMatcher = new GroupMatch(g_config->index.multiVersionWhitelist, g_config->index.multiVersionBlacklist);
+  if (g_config->edg.baseDir.size())
+    edg::setBaseDirectory(g_config->edg.baseDir);
 }
 
 IndexResult index(WorkingFiles *wfiles, VFS *vfs, const std::string &opt_wdir, const std::string &main,
                   const std::vector<const char *> &args,
                   const std::vector<std::pair<std::string, std::string>> &remapped, bool no_linkage, bool &ok) {
   ok = true;
-  auto pch = std::make_shared<PCHContainerOperations>();
-  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> fs = llvm::vfs::getRealFileSystem();
-  std::shared_ptr<CompilerInvocation> ci = buildCompilerInvocation(main, args, fs);
+  EdgInvocation inv;
   // e.g. .s
-  if (!ci)
+  if (!buildEdgInvocation(args, main, inv))
     return {};
   ok = false;
-  // -fparse-all-comments enables documentation in the indexer and in
-  // code completion.
-#if LLVM_VERSION_MAJOR >= 24 // llvmorg-24-init-12130-g6cd72b33224f
-  ci->getLangOpts().CommentOpts.ParseAllComments = g_config->index.comments > 1;
-  ci->getLangOpts().CommentOpts.RetainComments = true;
-  ci->getLangOpts().CommentOpts.RetainCommentsFromSystemHeaders = true;
-#elif LLVM_VERSION_MAJOR >= 18
-  ci->getLangOpts().CommentOpts.ParseAllComments = g_config->index.comments > 1;
-  ci->getLangOpts().RetainCommentsFromSystemHeaders = true;
-#else
-  ci->getLangOpts()->CommentOpts.ParseAllComments = g_config->index.comments > 1;
-  ci->getLangOpts()->RetainCommentsFromSystemHeaders = true;
-#endif
-  std::string buf = wfiles->getContent(main);
-  std::vector<std::unique_ptr<llvm::MemoryBuffer>> bufs;
-  if (buf.size())
-    for (auto &[filename, content] : remapped) {
-      bufs.push_back(llvm::MemoryBuffer::getMemBuffer(content));
-      ci->getPreprocessorOpts().addRemappedFile(filename, bufs.back().get());
-    }
+  edg::Request req;
+  req.args = std::move(inv.args);
+  req.args.insert(req.args.begin(), "--no_warnings");
+  req.index = true;
+  req.all_linkages = no_linkage;
+  if (wfiles->getContent(main).size())
+    req.remapped = remapped;
 
-  IndexDiags dc;
-#if LLVM_VERSION_MAJOR >= 21
-  auto clang = std::make_unique<CompilerInstance>(std::move(ci), pch);
-#else
-  auto clang = std::make_unique<CompilerInstance>(pch);
-  clang->setInvocation(std::move(ci));
-#endif
-#if LLVM_VERSION_MAJOR >= 22
-  // Must precede createDiagnostics, which dereferences the VFS. Use
-  // createVirtualFileSystem (not setVirtualFileSystem) so -ivfsoverlay applies.
-  clang->createVirtualFileSystem(fs);
-#endif
-  clang->createDiagnostics(
-#if LLVM_VERSION_MAJOR >= 20 && LLVM_VERSION_MAJOR < 22
-      *fs,
-#endif
-      &dc, false);
-  clang->getDiagnostics().setIgnoreAllWarnings(true);
-#if LLVM_VERSION_MAJOR >= 21
-  clang->setTarget(TargetInfo::CreateTargetInfo(clang->getDiagnostics(), clang->getTargetOpts()));
-#else
-  clang->setTarget(TargetInfo::CreateTargetInfo(clang->getDiagnostics(), clang->getInvocation().TargetOpts));
-#endif
-  if (!clang->hasTarget())
-    return {};
-  clang->getPreprocessorOpts().RetainRemappedFileBuffers = true;
-#if LLVM_VERSION_MAJOR >= 22
-  clang->createFileManager();
-#else
-  clang->createFileManager(fs);
-#endif
-  clang->setSourceManager(new SourceManager(clang->getDiagnostics(), clang->getFileManager(), true));
-
-  IndexParam param(*vfs, no_linkage);
-
-  index::IndexingOptions indexOpts;
-  indexOpts.SystemSymbolFilter = index::IndexingOptions::SystemSymbolFilterKind::All;
-  if (no_linkage) {
-    indexOpts.IndexFunctionLocals = true;
-    indexOpts.IndexImplicitInstantiation = true;
-    indexOpts.IndexParametersInDeclarations = g_config->index.parametersInDeclarations;
-    indexOpts.IndexTemplateParameters = true;
-  }
-
-  auto action = std::make_unique<IndexFrontendAction>(std::make_shared<IndexDataConsumer>(param), indexOpts, param);
-  std::string reason;
+  edg::Unit unit;
+  IndexParam param(*vfs, no_linkage, unit, req.remapped);
+  req.want_file = [&](int fid, const std::string &) { return param.consumeFile(fid) != nullptr; };
   {
     llvm::CrashRecoveryContext crc;
-    auto parse = [&]() {
-      if (!action->BeginSourceFile(*clang, clang->getFrontendOpts().Inputs[0]))
-        return;
-      if (llvm::Error e = action->Execute()) {
-        reason = llvm::toString(std::move(e));
-        return;
-      }
-      action->EndSourceFile();
-      ok = true;
-    };
-    if (!crc.RunSafely(parse)) {
-      LOG_S(ERROR) << "clang crashed for " << main;
+    if (!crc.RunSafely([&]() { edg::run(req, unit); })) {
+      LOG_S(ERROR) << "the front end crashed for " << main;
+      llvm::CrashRecoveryContext().RunSafely([]() { edg::recover(); });
       return {};
     }
   }
-  if (!ok) {
+  if (!unit.completed) {
+    std::string reason;
+    for (Diag &d : parseSarif(unit.sarif))
+      if (d.level >= DiagLevel::Error) {
+        reason = d.message;
+        break;
+      }
     LOG_S(ERROR) << "failed to index " << main << (reason.empty() ? "" : ": " + reason);
+    if (LOG_V_ENABLED(1)) {
+      std::string line;
+      for (auto &arg : req.args)
+        (line += ' ') += arg;
+      LOG_V(1) << "front end arguments:" << line << "\n" << unit.sarif;
+    }
     return {};
   }
+  ok = true;
+
+  Indexer indexer(param);
+  for (const edg::Occurrence &o : unit.occurrences)
+    indexer.addOccurrence(o);
+  indexer.addIncludes();
+  indexer.addSkippedRanges();
+  // The main file is indexed even if it has no symbol.
+  for (size_t i = 0; i < unit.files.size(); i++)
+    if (param.file((int)i).path == main || unit.files[i].path == main)
+      param.consumeFile((int)i);
 
   IndexResult result;
-  result.n_errs = (int)dc.getNumErrors();
-  // clang 7 does not implement operator std::string.
-  result.first_error = std::string(dc.message.data(), dc.message.size());
-  for (auto &it : param.uid2file) {
-    if (!it.second.db)
+  result.n_errs = unit.n_errors;
+  std::vector<Diag> diags = parseSarif(unit.sarif);
+  for (Diag &d : diags)
+    if (d.level >= DiagLevel::Error) {
+      result.first_error = d.file + ":" + std::to_string(d.range.start.line + 1) + ": " + d.message;
+      break;
+    }
+  for (File &file : param.files) {
+    if (!file.db)
       continue;
-    std::unique_ptr<IndexFile> &entry = it.second.db;
+    std::unique_ptr<IndexFile> &entry = file.db;
     entry->import_file = main;
     entry->args = args;
-    for (auto &[_, it] : entry->uid2lid_and_path)
-      if (it.first >= 0)
-        entry->lid2path.emplace_back(it.first, std::move(it.second));
-    entry->uid2lid_and_path.clear();
+    entry->language = inv.lang;
+    // Instantiating a class template re-declares the members of the template.
+    auto dropDefinition = [](auto &entity) {
+      if (entity.def.spell)
+        entity.declarations.erase(std::remove_if(entity.declarations.begin(), entity.declarations.end(),
+                                                 [&](const DeclRef &d) { return d.range == entity.def.spell->range; }),
+                                  entity.declarations.end());
+    };
+    for (auto &it : entry->usr2func)
+      dropDefinition(it.second);
+    for (auto &it : entry->usr2type)
+      dropDefinition(it.second);
+    for (auto &it : entry->usr2var)
+      dropDefinition(it.second);
     for (auto &it : entry->usr2func) {
       // e.g. declaration + out-of-line definition
       uniquify(it.second.derived);
       uniquify(it.second.uses);
+      uniquify(it.second.declarations);
+      uniquify(it.second.def.bases);
+      uniquify(it.second.def.vars);
+      uniquify(it.second.def.callees);
     }
     for (auto &it : entry->usr2type) {
       uniquify(it.second.derived);
       uniquify(it.second.uses);
-      // e.g. declaration + out-of-line definition
+      uniquify(it.second.declarations);
+      uniquify(it.second.instances);
       uniquify(it.second.def.bases);
       uniquify(it.second.def.funcs);
+      uniquify(it.second.def.types);
     }
-    for (auto &it : entry->usr2var)
+    for (auto &it : entry->usr2var) {
       uniquify(it.second.uses);
+      uniquify(it.second.declarations);
+    }
 
     // Update dependencies for the file.
-    for (auto &[_, file] : param.uid2file) {
-      const std::string &path = file.path;
-      if (path.empty())
+    for (File &f : param.files) {
+      if (f.path.empty())
         continue;
-      if (path == entry->path)
-        entry->mtime = file.mtime;
-      else if (path != entry->import_file)
-        entry->dependencies[llvm::CachedHashStringRef(intern(path))] = file.mtime;
+      if (f.path == entry->path)
+        entry->mtime = f.mtime;
+      else if (f.path != entry->import_file)
+        entry->dependencies[llvm::CachedHashStringRef(intern(f.path))] = f.mtime;
     }
     result.indexes.push_back(std::move(entry));
   }
-
   return result;
 }
 } // namespace idx

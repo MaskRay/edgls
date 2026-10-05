@@ -10,7 +10,7 @@ OUTPUT:
   "includes": [],
   "skipped_ranges": [],
   "usr2func": [{
-      "usr": 4259594751088586730,
+      "usr": 9608532274827022249,
       "detailed_name": "void foo()",
       "qual_name_offset": 5,
       "short_name": "foo",

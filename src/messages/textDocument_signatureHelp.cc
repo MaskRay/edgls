@@ -3,13 +3,10 @@
 
 #include "message_handler.hh"
 #include "pipeline.hh"
-#include "sema_manager.hh"
-
-#include <clang/Sema/Sema.h>
+#include "query.hh"
+#include "working_files.hh"
 
 namespace ccls {
-using namespace clang;
-
 namespace {
 struct ParameterInformation {
   std::vector<int> label;
@@ -28,157 +25,163 @@ REFLECT_STRUCT(ParameterInformation, label);
 REFLECT_STRUCT(SignatureInformation, label, documentation, parameters);
 REFLECT_STRUCT(SignatureHelp, signatures, activeSignature, activeParameter);
 
-void buildOptional(const CodeCompletionString &ccs, std::string &label, std::vector<ParameterInformation> &ls_params) {
-  for (const auto &chunk : ccs) {
-    switch (chunk.Kind) {
-    case CodeCompletionString::CK_Optional:
-      buildOptional(*chunk.Optional, label, ls_params);
-      break;
-    case CodeCompletionString::CK_Placeholder:
-      // A string that acts as a placeholder for, e.g., a function call
-      // argument.
-      // Intentional fallthrough here.
-    case CodeCompletionString::CK_CurrentParameter: {
-      // A piece of text that describes the parameter that corresponds to
-      // the code-completion location within a function call, message send,
-      // macro invocation, etc.
-      int off = (int)label.size();
-      label += chunk.Text;
-      ls_params.push_back({{off, (int)label.size()}});
-      break;
-    }
-    case CodeCompletionString::CK_VerticalSpace:
-      break;
-    default:
-      label += chunk.Text;
-      break;
+// Build a signature from a function's detailed name, e.g.
+// "int ns::f(int, const char *) const".
+SignatureInformation buildSignature(const QueryFunc::Def &def) {
+  SignatureInformation sig;
+  sig.label = def.detailed_name;
+  if (def.comments[0])
+    sig.documentation = def.comments;
+  size_t i = sig.label.find('(', def.short_name_offset + def.short_name_size);
+  if (i == std::string::npos)
+    return sig;
+  int depth = 0;
+  size_t start = i + 1;
+  for (size_t j = i + 1; j < sig.label.size(); j++) {
+    char c = sig.label[j];
+    if (c == '(' || c == '<' || c == '[' || c == '{')
+      depth++;
+    else if ((c == ')' || c == '>' || c == ']' || c == '}') && depth > 0)
+      depth--;
+    else if ((c == ',' || c == ')') && depth == 0) {
+      size_t b = start, e = j;
+      while (b < e && sig.label[b] == ' ')
+        b++;
+      if (b < e)
+        sig.parameters.push_back({{(int)b, (int)e}});
+      start = j + 1;
+      if (c == ')')
+        break;
     }
   }
+  if (sig.parameters.size() == 1) {
+    auto &l = sig.parameters[0].label;
+    if (sig.label.compare(l[0], l[1] - l[0], "void") == 0)
+      sig.parameters.clear();
+  }
+  return sig;
 }
-
-class SignatureHelpConsumer : public CodeCompleteConsumer {
-  std::shared_ptr<GlobalCodeCompletionAllocator> alloc;
-  CodeCompletionTUInfo cCTUInfo;
-
-public:
-  bool from_cache;
-  SignatureHelp ls_sighelp;
-  SignatureHelpConsumer(const clang::CodeCompleteOptions &opts, bool from_cache)
-      : CodeCompleteConsumer(opts), alloc(std::make_shared<GlobalCodeCompletionAllocator>()), cCTUInfo(alloc),
-        from_cache(from_cache) {}
-  void ProcessOverloadCandidates(Sema &s, unsigned currentArg, OverloadCandidate *candidates, unsigned numCandidates,
-                                 SourceLocation openParLoc
-#if LLVM_VERSION_MAJOR >= 14
-                                 ,
-                                 bool braced
-#endif
-                                 ) override {
-    ls_sighelp.activeParameter = (int)currentArg;
-    for (unsigned i = 0; i < numCandidates; i++) {
-      OverloadCandidate cand = candidates[i];
-      // We want to avoid showing instantiated signatures, because they may be
-      // long in some cases (e.g. when 'T' is substituted with 'std::string', we
-      // would get 'std::basic_string<char>').
-      if (auto *func = cand.getFunction())
-        if (auto *pattern = func->getTemplateInstantiationPattern())
-          cand = OverloadCandidate(pattern);
-
-      const auto *ccs =
-#if LLVM_VERSION_MAJOR >= 14
-          cand.CreateSignatureString(currentArg, s, *alloc, cCTUInfo, true, braced);
-#else
-          cand.CreateSignatureString(currentArg, s, *alloc, cCTUInfo, true);
-#endif
-
-      const char *ret_type = nullptr;
-      SignatureInformation &ls_sig = ls_sighelp.signatures.emplace_back();
-      const RawComment *rc = getCompletionComment(s.getASTContext(), cand.getFunction());
-      ls_sig.documentation = rc ? rc->getBriefText(s.getASTContext()) : "";
-      for (const auto &chunk : *ccs)
-        switch (chunk.Kind) {
-        case CodeCompletionString::CK_ResultType:
-          ret_type = chunk.Text;
-          break;
-        case CodeCompletionString::CK_Placeholder:
-        case CodeCompletionString::CK_CurrentParameter: {
-          int off = (int)ls_sig.label.size();
-          ls_sig.label += chunk.Text;
-          ls_sig.parameters.push_back({{off, (int)ls_sig.label.size()}});
-          break;
-        }
-        case CodeCompletionString::CK_Optional:
-          buildOptional(*chunk.Optional, ls_sig.label, ls_sig.parameters);
-          break;
-        case CodeCompletionString::CK_VerticalSpace:
-          break;
-        default:
-          ls_sig.label += chunk.Text;
-          break;
-        }
-      if (ret_type) {
-        ls_sig.label += " -> ";
-        ls_sig.label += ret_type;
-      }
-    }
-    std::sort(ls_sighelp.signatures.begin(), ls_sighelp.signatures.end(),
-              [](const SignatureInformation &l, const SignatureInformation &r) {
-                if (l.parameters.size() != r.parameters.size())
-                  return l.parameters.size() < r.parameters.size();
-                if (l.label.size() != r.label.size())
-                  return l.label.size() < r.label.size();
-                return l.label < r.label;
-              });
-  }
-
-  CodeCompletionAllocator &getAllocator() override { return *alloc; }
-  CodeCompletionTUInfo &getCodeCompletionTUInfo() override { return cCTUInfo; }
-};
 } // namespace
 
 void MessageHandler::textDocument_signatureHelp(TextDocumentPositionParam &param, ReplyOnce &reply) {
-  static CompleteConsumerCache<SignatureHelp> cache;
-  Position begin_pos = param.position;
   std::string path = param.textDocument.uri.getPath();
   WorkingFile *wf = wfiles->getFile(path);
   if (!wf) {
     reply.notOpened(path);
     return;
   }
-  std::string buffer_line;
-  if (param.position.line >= 0 && param.position.line < wf->buffer_lines.size())
-    buffer_line = wf->buffer_lines[param.position.line];
-  {
-    std::string filter;
-    begin_pos = wf->getCompletionPosition(param.position, &filter);
+  SignatureHelp result;
+  QueryFile *file = findFile(path);
+  const std::string &content = wf->buffer_content;
+  int off = getOffsetForPosition(param.position, content);
+  if (!file || off < 0) {
+    reply(result);
+    return;
   }
 
-  SemaManager::OnComplete callback = [reply, path, begin_pos, buffer_line](CodeCompleteConsumer *optConsumer) {
-    if (!optConsumer)
-      return;
-    auto *consumer = static_cast<SignatureHelpConsumer *>(optConsumer);
-    reply(consumer->ls_sighelp);
-    if (!consumer->from_cache) {
-      cache.withLock([&]() {
-        cache.path = path;
-        cache.line = buffer_line;
-        cache.position = begin_pos;
-        cache.result = consumer->ls_sighelp;
-      });
+  // Find the unmatched '(' before the cursor and count the arguments.
+  int depth = 0, args = 0, open = -1;
+  for (int i = std::min<int>(off, content.size()) - 1; i >= 0 && off - i < 4096; i--) {
+    char c = content[i];
+    if (c == ')' || c == ']' || c == '}')
+      depth++;
+    else if (c == '(' || c == '[' || c == '{') {
+      if (depth-- == 0) {
+        if (c == '(')
+          open = i;
+        break;
+      }
+    } else if (c == ',' && depth == 0)
+      args++;
+    else if (c == ';')
+      break;
+  }
+  if (open < 0) {
+    reply(result);
+    return;
+  }
+  int name_end = open;
+  while (name_end > 0 && isspace((unsigned char)content[name_end - 1]))
+    name_end--;
+  // Skip explicit template arguments: f<int>(
+  if (name_end > 0 && content[name_end - 1] == '>') {
+    int d = 0;
+    for (int i = name_end - 1; i >= 0; i--) {
+      if (content[i] == '>')
+        d++;
+      else if (content[i] == '<' && --d == 0) {
+        name_end = i;
+        break;
+      }
     }
-  };
-
-  CodeCompleteOptions ccOpts;
-  ccOpts.IncludeGlobals = false;
-  ccOpts.IncludeMacros = false;
-  ccOpts.IncludeBriefComments = true;
-  if (cache.isCacheValid(path, buffer_line, begin_pos)) {
-    SignatureHelpConsumer consumer(ccOpts, true);
-    cache.withLock([&]() { consumer.ls_sighelp = cache.result; });
-    callback(&consumer);
-  } else {
-    manager->comp_tasks.pushBack(std::make_unique<SemaManager::CompTask>(
-        reply.id, param.textDocument.uri.getPath(), param.position,
-        std::make_unique<SignatureHelpConsumer>(ccOpts, false), ccOpts, callback));
   }
+  if (name_end == 0 || !isAsciiIdentifierContinue(content[name_end - 1])) {
+    reply(result);
+    return;
+  }
+  Position name_pos = getPositionForOffset(content, name_end - 1);
+
+  std::vector<SymbolIdx> syms;
+  for (SymbolRef sym : findSymbolsAtLocation(wf, file, name_pos))
+    syms.push_back(sym);
+  if (syms.empty()) {
+    // The call may be on a line being edited.
+    int b = name_end;
+    while (b > 0 && isAsciiIdentifierContinue(content[b - 1]))
+      b--;
+    int q = b;
+    while (q >= 2 && content.compare(q - 2, 2, "::") == 0) {
+      int r = q - 2;
+      while (r > 0 && isAsciiIdentifierContinue(content[r - 1]))
+        r--;
+      if (r == q - 2)
+        break;
+      q = r;
+    }
+    std::string_view name(content.data() + b, name_end - b);
+    std::string_view qualifier = q < b ? std::string_view(content.data() + q, b - 2 - q) : std::string_view();
+    int col = param.position.character;
+    std::optional<int> line = wf->getIndexPosFromBufferPos(param.position.line, &col, false);
+    syms = lookupName(db, file, {(uint16_t)(line ? *line : param.position.line), (int16_t)col}, name, qualifier);
+  }
+
+  std::vector<const QueryFunc::Def *> cands;
+  for (SymbolIdx sym : syms) {
+    if (sym.kind == Kind::Func && db->hasFunc(sym.usr)) {
+      if (auto *def = db->getFunc(sym.usr).anyDef()) {
+        std::string_view qualified = def->name(true);
+        // Overloads with the same qualified name.
+        for (QueryFunc &func : db->funcs)
+          if (auto *def1 = func.anyDef(); def1 && def1->name(true) == qualified)
+            cands.push_back(def1);
+      }
+    } else if (sym.kind == Kind::Type && db->hasType(sym.usr)) {
+      // Constructors.
+      for (auto &tdef : db->getType(sym.usr).def)
+        for (Usr usr : tdef.funcs)
+          if (db->hasFunc(usr))
+            if (auto *def = db->getFunc(usr).anyDef(); def && def->kind == SymbolKind::Constructor)
+              cands.push_back(def);
+    }
+    if (cands.size())
+      break;
+  }
+  std::sort(cands.begin(), cands.end());
+  cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
+  for (auto *def : cands)
+    result.signatures.push_back(buildSignature(*def));
+  std::sort(result.signatures.begin(), result.signatures.end(),
+            [](const SignatureInformation &l, const SignatureInformation &r) {
+              if (l.parameters.size() != r.parameters.size())
+                return l.parameters.size() < r.parameters.size();
+              return l.label < r.label;
+            });
+  result.activeParameter = args;
+  for (size_t i = 0; i < result.signatures.size(); i++)
+    if ((int)result.signatures[i].parameters.size() > args) {
+      result.activeSignature = (int)i;
+      break;
+    }
+  reply(result);
 }
 } // namespace ccls

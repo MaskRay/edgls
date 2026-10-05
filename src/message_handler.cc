@@ -16,8 +16,6 @@
 #include <algorithm>
 #include <stdexcept>
 
-using namespace clang;
-
 #if LLVM_VERSION_MAJOR < 15 // llvmorg-15-init-6118-gb39f43775796
 namespace llvm {
 template <typename T, typename E> constexpr bool is_contained(std::initializer_list<T> set, const E &e) {
